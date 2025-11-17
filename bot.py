@@ -35,18 +35,27 @@ def webhook():
 def index():
     return '<h1>Telegram бот работает на Render!</h1>'
 
-# ===================== УСТАНОВКА WEBHOOK ПРИ СТАРТЕ =====================
-def setup_webhook():
-    time.sleep(3)  # даём gunicorn полностью подняться
+# === Надёжная установка webhook на Render (2025 версия) ===
+from flask import Flask
+import atexit
+
+def final_webhook_setup():
+    import time
+    time.sleep(4)
+    url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
     bot.remove_webhook()
     time.sleep(1)
-    
-    url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
-    result = bot.set_webhook(url=url)
-    if result:
-        print(f"Webhook успешно установлен: {url}")
-    else:
-        print("ОШИБКА установки webhook!")
+    try:
+        bot.set_webhook(url=url, max_connections=100, allowed_updates=[])
+        print(f"WEBHOOK УСПЕШНО УСТАНОВЛЕН: {url}")
+    except Exception as e:
+        print(f"Ошибка установки webhook: {e}")
+
+# Это сработает даже если потоки убиты
+atexit.register(final_webhook_setup)
+
+# Дополнительно — попробуем сразу (иногда помогает)
+threading.Thread(target=final_webhook_setup, daemon=True).start()
 
 # Запускаем в отдельном потоке — это работает и под gunicorn
 threading.Thread(target=setup_webhook, daemon=True).start()
