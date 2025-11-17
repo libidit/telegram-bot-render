@@ -1,56 +1,29 @@
 import telebot
 from flask import Flask, request
 import os
+import threading
+import time
 
-TOKEN = "8116386232:AAEj8J_3oaFazKpONtB9PcpmTxjzAIven9w"  # ← СЮДА СВОЙ ТОКЕН
+# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+TOKEN = "ТОКЕН_ЗДЕСЬ"   # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
 
 bot = telebot.TeleBot(TOKEN)
 
-# ========== ТВОИ ХЕНДЛЕРЫ ЗДЕСЬ ==========
+# ===================== ТВОИ ХЕНДЛЕРЫ =====================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "Привет! Я теперь живу на Render 🚀\nРаботаю 24/7 без polling и ошибок 409 :)")
+    bot.reply_to(message, "Привет! Я теперь живу на Render 24/7 🚀")
 
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
     bot.reply_to(message, message.text)
 
-# ================= WEBHOOK =================
+# ===================== FLASK =====================
 app = Flask(__name__)
 
 @app.route('/' + TOKEN, methods=['POST'])
-def get_message():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        return '<h1>Бот работает!</h1>', 200
-
-@app.route('/')
-def index():
-    return '<h1>Telegram бот на Render</h1><p>Всё ок!</p>'
-
-# === Установка webhook при старте (работает и под gunicorn) ===
-import threading
-
-def set_webhook():
-    import time
-    time.sleep(2)  # даём gunicorn время подняться
-    bot.remove_webhook()
-    time.sleep(1)
-    
-    url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
-    bot.set_webhook(url=url)
-    print(f"Webhook успешно установлен: {url}")
-
-# Запускаем установку webhook в отдельном потоке, чтобы не блокировать основной
-threading.Thread(target=set_webhook, daemon=True).start()
-
-# ================= Flask routes =================
-@app.route('/' + TOKEN, methods=['POST'])
-def get_message():
+def webhook():
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
@@ -60,7 +33,25 @@ def get_message():
 
 @app.route('/')
 def index():
-    return '<h1>Бот работает на Render!</h1>', 200
+    return '<h1>Telegram бот работает на Render!</h1>'
+
+# ===================== УСТАНОВКА WEBHOOK ПРИ СТАРТЕ =====================
+def setup_webhook():
+    time.sleep(3)  # даём gunicorn полностью подняться
+    bot.remove_webhook()
+    time.sleep(1)
     
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
+    result = bot.set_webhook(url=url)
+    if result:
+        print(f"Webhook успешно установлен: {url}")
+    else:
+        print("ОШИБКА установки webhook!")
+
+# Запускаем в отдельном потоке — это работает и под gunicorn
+threading.Thread(target=setup_webhook, daemon=True).start()
+
+# Это нужно для Render (gunicorn ищет именно такую переменную)
+application = app
+
+# Больше ничего не нужно! Никакого if __name__ == '__main__'
