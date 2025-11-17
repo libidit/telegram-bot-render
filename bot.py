@@ -5,7 +5,7 @@ import threading
 import time
 
 # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-TOKEN = "ТОКЕН_ЗДЕСЬ"   # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+TOKEN = "8116386232:AAEj8J_3oaFazKpONtB9PcpmTxjzAIven9w"   # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
 # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
 
 bot = telebot.TeleBot(TOKEN)
