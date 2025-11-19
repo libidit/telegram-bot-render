@@ -322,7 +322,7 @@ def process_step(uid, chat, text, user_repr):
         # -------------------------- ACTION --------------------------
         if step == "action":
             if text not in ("Запуск", "Остановка"):
-                send(chat, "Выберите действие:", keyboard([["Запуск", "Остановка"], ["Отмена"])); return
+                send(chat, "Выберите действие:", keyboard(["Запуск", "Остановка"], ["Отмена"])); return
             data["action"] = "запуск" if text == "Запуск" else "остановка"
 
             if data["action"] == "запуск":
