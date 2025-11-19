@@ -182,7 +182,7 @@ def process_step(uid, chat, text, user_repr):
             if text == "Другое время":
                 st["step"] = "time_custom"
                 send(chat, "Введите время чч:мм:", CANCEL_KB); return
-            if ":" in text and all(x.isdigit() for x in text.split(":")):
+            if len(text) == 5 and text[2] == ":" and text[:2].isdigit() and text[3:].isdigit():
                 data["time"] = text
                 st["step"] = "znp_prefix"
                 curr = datetime.now().strftime("%m%y")
@@ -193,7 +193,7 @@ def process_step(uid, chat, text, user_repr):
             send(chat, "Неверное время.", CANCEL_KB); return
 
         if step == "time_custom":
-            if ":" in text and all(x.isdigit() for x in text.split(":")):
+            if len(text) == 5 and text[2] == ":" and text[:2].isdigit() and text[3:].isdigit():
                 data["time"] = text
                 st["step"] = "znp_prefix"
                 curr = datetime.now().strftime("%m%y")
@@ -317,15 +317,19 @@ def process_step(uid, chat, text, user_repr):
             st["step"] = "time_custom"
             send(chat, "Введите время чч:мм:", CANCEL_KB)
             return
-        try:
-            h, m = map(int, text.split(":"))
-            data["time"] = text
-            st["step"] = "action"
-            send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
-            return
-        except:
-            send(chat, "Неверный формат времени.", CANCEL_KB)
-            return
+
+        # Принимаем только формат чч:мм (5 символов, двоеточие на 3-й позиции)
+        if len(text) == 5 and text[2] == ":" and text[:2].isdigit() and text[3:].isdigit():
+            h = int(text[:2])
+            m = int(text[3:])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                data["time"] = text
+                st["step"] = "action"
+                send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
+                return
+
+        send(chat, "Неверный формат времени.\nПример: <code>14:25</code> или <code>09:05</code>", CANCEL_KB)
+        return
 
     # -------------------------- ACTION --------------------------
     if step == "action":
