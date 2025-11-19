@@ -144,7 +144,7 @@ def process_step(uid, chat, text, user_repr):
             st["step"] = "date"
             today = datetime.now().strftime("%d.%m.%Y")
             yest = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
-            send(chat, "Дата:", keyboard([[today, yest], ["Другая дата", "Отмена"]]))
+            send(chat, "Дата:", keyboard([today, yest], ["Другая дата", "Отмена"]))
             return
 
         if step == "date":
