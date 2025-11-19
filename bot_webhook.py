@@ -1,6 +1,8 @@
-# bot_webhook.py — Clean architecture + FileLock (workers=2) + strict ordering + 10 min timeout
-# Author: Grok (adapted), 2025
-# Optimized for Render.com with GOOGLE_CREDS_JSON as dict + ZNP with prefix + dash
+# bot_webhook.py — финальная версия с:
+# • причинами из листа "Причина остановки"
+# • ZNP: D1125-5678 (с дефисом)
+# • 4 кнопки префикса + Другое
+# • работает на Render.com
 
 import os
 import json
@@ -28,13 +30,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
-if not TELEGRAM_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
-    raise RuntimeError("Missing environment variables: TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON")
+if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON]):
+    raise RuntimeError("Missing required env vars")
 
-# Parse JSON creds to dict
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
-
-# Create credentials from dict
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -48,31 +47,42 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
 STARTSTOP_SHEET_NAME = "Старт-Стоп"
-HEADERS = [
-    "Дата", "Время", "Номер линии", "Действие",
-    "Причина", "ЗНП", "Метров брака",
-    "Пользователь", "Время отправки", "Статус"
-]
+REASONS_SHEET_NAME = "Причина остановки"
 
+# Кэшируем причины на 5 минут (чтобы не дёргать таблицу каждый раз)
+_reasons_cache = {"data": [], "until": 0}
+
+def get_reasons():
+    """Получить список причин из листа 'Причина остановки', столбец A"""
+    global _reasons_cache
+    now = time.time()
+    if now < _reasons_cache["until"]:
+        return _reasons_cache["data"]
+
+    try:
+        ws = sh.worksheet(REASONS_SHEET_NAME)
+        values = ws.col_values(1)  # столбец A
+        reasons = [r.strip() for r in values if r.strip()]
+        _reasons_cache = {"data": reasons, "until": now + 300}  # кэш 5 минут
+        return reasons
+    except Exception as e:
+        log.exception("Не удалось загрузить причины остановки")
+        return ["Неисправность", "Переналадка", "Нет заготовки", "Другое"]
 
 def get_ws():
     try:
         ws = sh.worksheet(STARTSTOP_SHEET_NAME)
     except:
         ws = sh.add_worksheet(STARTSTOP_SHEET_NAME, rows=2000, cols=20)
-
     first = ws.row_values(1)
-    if first != HEADERS:
+    if first != ["Дата", "Время", "Номер линии", "Действие", "Причина", "ЗНП", "Метров брака", "Пользователь", "Время отправки", "Статус"]:
         ws.clear()
-        ws.insert_row(HEADERS, 1)
+        ws.insert_row(["Дата", "Время", "Номер линии", "Действие", "Причина", "ЗНП", "Метров брака", "Пользователь", "Время отправки", "Статус"], 1)
     return ws
-
 
 ws = get_ws()
 
-
 def append_row(d):
-    """Append a row to Start/Stop sheet."""
     row = [
         d["date"], d["time"], d["line"], d["action"],
         d.get("reason", ""), d["znp"], d["meters"],
@@ -80,89 +90,59 @@ def append_row(d):
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
-
 # -----------------------------------------------------------------------------
-# Telegram API
+# Telegram helpers
 # -----------------------------------------------------------------------------
 TG_SEND = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-
 def send(chat_id, text, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-
     try:
         requests.post(TG_SEND, json=payload, timeout=10)
     except Exception:
         log.exception("Failed to send message")
 
-
-# -----------------------------------------------------------------------------
-# Keyboards
-# -----------------------------------------------------------------------------
 def keyboard(rows):
-    return {"keyboard": [[{"text": txt} for txt in row] for row in rows],
-            "resize_keyboard": True}
+    return {"keyboard": [[{"text": txt} for txt in row] for row in rows], "resize_keyboard": True}
 
-
-MAIN_KB = keyboard([
-    ["Старт/Стоп"],
-    ["Брак"],
-    ["Отменить последнюю запись"]
-])
-
+MAIN_KB = keyboard([["Старт/Стоп"], ["Брак"], ["Отменить последнюю запись"]])
 CANCEL_KB = keyboard([["Отмена"]])
 
-
 # -----------------------------------------------------------------------------
-# State machine
+# State & timeout
 # -----------------------------------------------------------------------------
-states = {}            # uid → {"step":..., "data":..., "chat":...}
-last_activity = {}     # uid → timestamp
-TIMEOUT = 600          # 10 minutes
-
+states = {}
+last_activity = {}
+TIMEOUT = 600
 
 def check_timeouts():
-    """Auto-cancel inactive flows."""
     while True:
         time.sleep(30)
         now = time.time()
-
         for uid in list(states.keys()):
             if now - last_activity.get(uid, now) > TIMEOUT:
                 chat = states[uid]["chat"]
                 send(chat, "Диалог завершён из-за отсутствия активности (10 минут).")
                 states.pop(uid, None)
 
-
 threading.Thread(target=check_timeouts, daemon=True).start()
 
-
 # -----------------------------------------------------------------------------
-# Step processor
+# Main FSM
 # -----------------------------------------------------------------------------
 def process_step(uid, chat, text, user_repr):
-    """Main finite-state-machine logic per user."""
-
-    # Update activity timestamp
     last_activity[uid] = time.time()
 
-    # If no active flow
     if uid not in states:
         if text == "Старт/Стоп":
             states[uid] = {"step": "line", "data": {}, "chat": chat}
             send(chat, "Введите номер линии (1–15):", CANCEL_KB)
             return
-
         send(chat, "Выберите действие:", MAIN_KB)
         return
 
-    # If user cancelled
     if text == "Отмена":
         states.pop(uid, None)
         send(chat, "Отменено.", MAIN_KB)
@@ -172,88 +152,44 @@ def process_step(uid, chat, text, user_repr):
     step = st["step"]
     data = st["data"]
 
-    # -------------------------------------------------------------------------
-    # Step: line
-    # -------------------------------------------------------------------------
+    # -------------------------- LINE --------------------------
     if step == "line":
         if not (text.isdigit() and 1 <= int(text) <= 15):
             send(chat, "Введите номер линии 1–15:", CANCEL_KB)
             return
-
         data["line"] = text
         st["step"] = "date"
-
         today = datetime.now().strftime("%d.%m.%Y")
         yest = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
         send(chat, "Дата:", keyboard([[today, yest], ["Другая дата", "Отмена"]]))
         return
 
-    # -------------------------------------------------------------------------
-    # Step: date
-    # -------------------------------------------------------------------------
-    if step == "date":
+    # -------------------------- DATE --------------------------
+    if step in ("date", "date_custom"):
         if text == "Другая дата":
             st["step"] = "date_custom"
             send(chat, "Введите дату в формате дд.мм.гггг:", CANCEL_KB)
             return
-
         try:
             d, m, y = map(int, text.split("."))
             datetime(y, m, d)
             data["date"] = text
-
             st["step"] = "time"
             now = datetime.now()
-            times = [
-                now.strftime("%H:%M"),
-                (now - timedelta(minutes=10)).strftime("%H:%M"),
-                (now - timedelta(minutes=20)).strftime("%H:%M"),
-                (now - timedelta(minutes=30)).strftime("%H:%M")
-            ]
-            send(chat, "Время:", keyboard([
-                [times[0], times[1], "Другое время"],
-                [times[2], times[3], "Отмена"]
-            ]))
+            times = [now.strftime("%H:%M"), (now - timedelta(minutes=10)).strftime("%H:%M"),
+                     (now - timedelta(minutes=20)).strftime("%H:%M"), (now - timedelta(minutes=30)).strftime("%H:%M")]
+            send(chat, "Время:", keyboard([[times[0], times[1], "Другое время"], [times[2], times[3], "Отмена"]]))
             return
         except:
             send(chat, "Неверный формат даты.", CANCEL_KB)
             return
 
-    # -------------------------------------------------------------------------
-    # Step: date_custom
-    # -------------------------------------------------------------------------
-    if step == "date_custom":
-        try:
-            d, m, y = map(int, text.split("."))
-            datetime(y, m, d)
-            data["date"] = text
-
-            st["step"] = "time"
-            now = datetime.now()
-            times = [
-                now.strftime("%H:%M"),
-                (now - timedelta(minutes=10)).strftime("%H:%M"),
-                (now - timedelta(minutes=20)).strftime("%H:%M"),
-                (now - timedelta(minutes=30)).strftime("%H:%M")
-            ]
-            send(chat, "Время:", keyboard([
-                [times[0], times[1], "Другое время"],
-                [times[2], times[3], "Отмена"]
-            ]))
-            return
-        except:
-            send(chat, "Неверная дата. Формат дд.мм.гггг", CANCEL_KB)
-            return
-
-    # -------------------------------------------------------------------------
-    # Step: time
-    # -------------------------------------------------------------------------
-    if step == "time":
+    # -------------------------- TIME --------------------------
+    if step in ("time", "time_custom"):
         if text == "Другое время":
             st["step"] = "time_custom"
             send(chat, "Введите время чч:мм:", CANCEL_KB)
             return
-
         try:
             h, m = map(int, text.split(":"))
             data["time"] = text
@@ -264,211 +200,142 @@ def process_step(uid, chat, text, user_repr):
             send(chat, "Неверный формат времени.", CANCEL_KB)
             return
 
-    # -------------------------------------------------------------------------
-    # Step: time_custom
-    # -------------------------------------------------------------------------
-    if step == "time_custom":
-        try:
-            h, m = map(int, text.split(":"))
-            data["time"] = text
-            st["step"] = "action"
-            send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
-            return
-        except:
-            send(chat, "Неверный формат времени чч:мм", CANCEL_KB)
-            return
-
-    # -------------------------------------------------------------------------
-    # Step: action
-    # -------------------------------------------------------------------------
+    # -------------------------- ACTION --------------------------
     if step == "action":
         if text not in ("Запуск", "Остановка"):
             send(chat, "Выберите действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
             return
-
         data["action"] = "запуск" if text == "Запуск" else "остановка"
 
         if data["action"] == "запуск":
             st["step"] = "znp_prefix"
-            now = datetime.now()
-            curr = now.strftime("%m%y")
-            prev = (now - timedelta(days=32)).strftime("%m%y")
-            kb = [
-                [f"D{curr}", f"L{curr}"],
-                [f"D{prev}", f"L{prev}"],
-                ["Другое", "Отмена"]
-            ]
+            curr = datetime.now().strftime("%m%y")
+            prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
+            kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
             send(chat, "Выберите префикс ЗНП:", keyboard(kb))
             return
 
-        # Остановка → причина
+        # Остановка → причины
         st["step"] = "reason"
-        send(chat, "Причина остановки:", keyboard([["Другое"], ["Отмена"]]))
+        reasons = get_reasons()
+        rows = [reasons[i:i+2] for i in range(0, len(reasons), 2)]
+        rows.append(["Другое", "Отмена"])
+        send(chat, "Причина остановки:", keyboard(rows))
         return
 
-    # -------------------------------------------------------------------------
-    # Step: reason
-    # -------------------------------------------------------------------------
+    # -------------------------- REASON --------------------------
     if step == "reason":
+        reasons = get_reasons()
         if text == "Другое":
             st["step"] = "reason_custom"
             send(chat, "Введите причину остановки:", CANCEL_KB)
             return
-
-        data["reason"] = text
-        st["step"] = "znp_prefix"
-        now = datetime.now()
-        curr = now.strftime("%m%y")
-        prev = (now - timedelta(days=32)).strftime("%m%y")
-        kb = [
-            [f"D{curr}", f"L{curr}"],
-            [f"D{prev}", f"L{prev}"],
-            ["Другое", "Отмена"]
-        ]
-        send(chat, "Выберите префикс ЗНП:", keyboard(kb))
+        if text in reasons or text == "Отмена":
+            data["reason"] = text
+            st["step"] = "znp_prefix"
+            curr = datetime.now().strftime("%m%y")
+            prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
+            kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+            send(chat, "Выберите префикс ЗНП:", keyboard(kb))
+            return
+        # если вдруг не в списке — показываем заново
+        rows = [reasons[i:i+2] for i in range(0, len(reasons), 2)]
+        rows.append(["Другое", "Отмена"])
+        send(chat, "Выберите из списка:", keyboard(rows))
         return
 
-    # -------------------------------------------------------------------------
-    # Step: reason_custom
-    # -------------------------------------------------------------------------
     if step == "reason_custom":
         data["reason"] = text
         st["step"] = "znp_prefix"
-        now = datetime.now()
-        curr = now.strftime("%m%y")
-        prev = (now - timedelta(days=32)).strftime("%m%y")
-        kb = [
-            [f"D{curr}", f"L{curr}"],
-            [f"D{prev}", f"L{prev}"],
-            ["Другое", "Отмена"]
-        ]
+        curr = datetime.now().strftime("%m%y")
+        prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
+        kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
         send(chat, "Выберите префикс ЗНП:", keyboard(kb))
         return
 
-    # -------------------------------------------------------------------------
-    # Step: znp_prefix — выбор префикса D/L + месяц
-    # -------------------------------------------------------------------------
+    # -------------------------- ZNP PREFIX --------------------------
     if step == "znp_prefix":
         now = datetime.now()
         curr = now.strftime("%m%y")
         prev = (now - timedelta(days=32)).strftime("%m%y")
         valid_prefixes = [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]
 
-        # Если ввёл 4 цифры — считаем, что это суффикс
-        if text.isdigit() and len(text) == 4:
-            prefix = data.get("znp_prefix", "")
-            if prefix in valid_prefixes:
-                data["znp"] = f"{prefix}-{text}"  # ← Дефис!
-                st["step"] = "meters"
-                send(chat, "Метров брака:", CANCEL_KB)
-                return
+        if text.isdigit() and len(text) == 4 and "znp_prefix" in data:
+            data["znp"] = f"{data['znp_prefix']}-{text}"
+            st["step"] = "meters"
+            send(chat, "Метров брака:", CANCEL_KB)
+            return
 
-        # Если выбрал префикс
         if text in valid_prefixes:
             data["znp_prefix"] = text
             send(chat, f"Введите последние 4 цифры для <b>{text}</b>:", CANCEL_KB)
             return
 
-        # Если нажал «Другое» — полный ручной ввод
         if text == "Другое":
             st["step"] = "znp_full_manual"
             send(chat, "Введите полный ЗНП (например D1125-5678):", CANCEL_KB)
             return
 
-        # Если ошибка — показываем клавиатуру снова
-        kb = [
-            [f"D{curr}", f"L{curr}"],
-            [f"D{prev}", f"L{prev}"],
-            ["Другое", "Отмена"]
-        ]
+        kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
         send(chat, "Выберите префикс ЗНП:", keyboard(kb))
         return
 
-    # -------------------------------------------------------------------------
-    # Step: znp_full_manual — полный ручной ввод
-    # -------------------------------------------------------------------------
+    # -------------------------- ZNP FULL MANUAL --------------------------
     if step == "znp_full_manual":
-        # Пример: D1125-5678
-        if len(text) == 10 and text[0] in ("D", "L") and text[5] == "-" and text[1:5].isdigit() and text[6:].isdigit():
+        if len(text) == 10 and text[0] in ("D","L") and text[5] == "-" and text[1:5].isdigit() and text[6:].isdigit():
             data["znp"] = text.upper()
             st["step"] = "meters"
             send(chat, "Метров брака:", CANCEL_KB)
             return
-        else:
-            send(chat, "Неверный формат. Пример: <code>D1125-5678</code>", CANCEL_KB)
-            return
+        send(chat, "Неверный формат. Пример: <code>D1125-5678</code>", CANCEL_KB)
+        return
 
-    # -------------------------------------------------------------------------
-    # Step: meters (final step)
-    # -------------------------------------------------------------------------
+    # -------------------------- METERS --------------------------
     if step == "meters":
         if not text.isdigit():
             send(chat, "Введите число:", CANCEL_KB)
             return
-
         data["meters"] = text
-
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         append_row({
-            "date": data["date"],
-            "time": data["time"],
-            "line": data["line"],
-            "action": data["action"],
-            "reason": data.get("reason", ""),
-            "znp": data["znp"],
-            "meters": data["meters"],
-            "user": user_repr,
-            "ts": ts
+            "date": data["date"], "time": data["time"], "line": data["line"],
+            "action": data["action"], "reason": data.get("reason", ""),
+            "znp": data["znp"], "meters": data["meters"],
+            "user": user_repr, "ts": ts
         })
-
         send(chat,
              f"<b>Записано!</b>\n"
-             f"Дата: {data['date']}\n"
-             f"Время: {data['time']}\n"
-             f"Линия: {data['line']}\n"
+             f"Дата: {data['date']}\nВремя: {data['time']}\nЛиния: {data['line']}\n"
              f"Действие: {'Запуск' if data['action']=='запуск' else 'Остановка'}\n"
-             f"Причина: {data.get('reason','—')}\n"
-             f"ЗНП: <code>{data['znp']}</code>\n"
+             f"Причина: {data.get('reason','—')}\nЗНП: <code>{data['znp']}</code>\n"
              f"Метров брака: {data['meters']}",
              MAIN_KB)
-
         states.pop(uid, None)
         return
 
-
 # -----------------------------------------------------------------------------
-# Flask app + FileLock per request
+# Flask
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 LOCK_PATH = "/tmp/telegram_bot.lock"
 
-
 @app.route("/health")
-def health():
-    return {"ok": True}
-
+def health(): return {"ok": True}
 
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(silent=True)
-    if not update:
-        return {"ok": True}
-
+    if not update: return {"ok": True}
     msg = update.get("message")
-    if not msg:
-        return {"ok": True}
-
+    if not msg: return {"ok": True}
     chat = msg["chat"]["id"]
     uid = msg["from"]["id"]
     text = (msg.get("text") or "").strip()
-    user_repr = f"{uid} (@{msg['from'].get('username', '') or 'без_username'})"
+    user_repr = f"{uid} (@{msg['from'].get('username','') or 'без_username'})"
 
     with FileLock(LOCK_PATH):
         process_step(uid, chat, text, user_repr)
-
     return {"ok": True}
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
