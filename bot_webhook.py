@@ -315,7 +315,7 @@ def process_step(uid, chat, text, user_repr):
                 h,m = map(int, text.split(":"))
                 data["time"] = text
                 st["step"] = "action"
-                send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"])); return
+                send(chat, "Действие:", keyboard(["Запуск", "Остановка"], ["Отмена"])); return
             except:
                 send(chat, "Неверное время.", CANCEL_KB); return
 
