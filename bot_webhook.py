@@ -279,165 +279,214 @@ def process_step(uid, chat, text, user_repr):
         # Для краткости оставляю без изменений — он уже был в предыдущих сообщениях и работает.
         # Если нужно — просто вставь сюда блок из сообщения от 19.11.2025 (где был Вид брака после метров)
 
-        # -------------------------- LINE --------------------------
-        if step == "line":
-            if not (text.isdigit() and 1 <= int(text) <= 15):
-                send(chat, "Введите номер линии 1–15:", CANCEL_KB); return
-            data["line"] = text
-            st["step"] = "date"
-            today = datetime.now().strftime("%d.%m.%Y")
-            yest = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
-            send(chat, "Дата:", keyboard([[today, yest], ["Другая дата", "Отмена"]])); return
+# -------------------------- LINE --------------------------
+    if step == "line":
+        if not (text.isdigit() and 1 <= int(text) <= 15):
+            send(chat, "Введите номер линии 1–15:", CANCEL_KB)
+            return
+        data["line"] = text
+        st["step"] = "date"
+        today = datetime.now().strftime("%d.%m.%Y")
+        yest = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
+        send(chat, "Дата:", keyboard([[today, yest], ["Другая дата", "Отмена"]]))
+        return
 
-        # -------------------------- DATE --------------------------
-        if step in ("date", "date_custom"):
-            if text == "Другая дата":
-                st["step"] = "date_custom"
-                send(chat, "Введите дату дд.мм.гггг:", CANCEL_KB); return
-            try:
-                d,m,y = map(int, text.split("."))
-                datetime(y,m,d)
-                data["date"] = text
-                st["step"] = "time"
-                now = datetime.now()
-                t = [now.strftime("%H:%M"), (now-timedelta(minutes=10)).strftime("%H:%M"),
-                     (now-timedelta(minutes=20)).strftime("%H:%M"), (now-timedelta(minutes=30)).strftime("%H:%M")]
-                send(chat, "Время:", keyboard([[t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"]])); return
-            except:
-                send(chat, "Неверная дата.", CANCEL_KB); return
+    # -------------------------- DATE --------------------------
+    if step in ("date", "date_custom"):
+        if text == "Другая дата":
+            st["step"] = "date_custom"
+            send(chat, "Введите дату в формате дд.мм.гггг:", CANCEL_KB)
+            return
+        try:
+            d, m, y = map(int, text.split("."))
+            datetime(y, m, d)
+            data["date"] = text
+            st["step"] = "time"
+            now = datetime.now()
+            times = [now.strftime("%H:%M"), (now - timedelta(minutes=10)).strftime("%H:%M"),
+                     (now - timedelta(minutes=20)).strftime("%H:%M"), (now - timedelta(minutes=30)).strftime("%H:%M")]
+            send(chat, "Время:", keyboard([[times[0], times[1], "Другое время"], [times[2], times[3], "Отмена"]]))
+            return
+        except:
+            send(chat, "Неверный формат даты.", CANCEL_KB)
+            return
 
-        # -------------------------- TIME --------------------------
-        if step in ("time", "time_custom"):
-            if text == "Другое время":
-                st["step"] = "time_custom"
-                send(chat, "Введите время чч:мм:", CANCEL_KB); return
-            try:
-                h,m = map(int, text.split(":"))
-                data["time"] = text
-                st["step"] = "action"
-                send(chat, "Действие:", keyboard(["Запуск", "Остановка"], ["Отмена"])); return
-            except:
-                send(chat, "Неверное время.", CANCEL_KB); return
+    # -------------------------- TIME --------------------------
+    if step in ("time", "time_custom"):
+        if text == "Другое время":
+            st["step"] = "time_custom"
+            send(chat, "Введите время чч:мм:", CANCEL_KB)
+            return
+        try:
+            h, m = map(int, text.split(":"))
+            data["time"] = text
+            st["step"] = "action"
+            send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
+            return
+        except:
+            send(chat, "Неверный формат времени.", CANCEL_KB)
+            return
 
-        # -------------------------- ACTION --------------------------
-        if step == "action":
-            if text not in ("Запуск", "Остановка"):
-                send(chat, "Выберите действие:", keyboard(["Запуск", "Остановка"], ["Отмена"])); return
-            data["action"] = "запуск" if text == "Запуск" else "остановка"
+    # -------------------------- ACTION --------------------------
+    if step == "action":
+        if text not in ("Запуск", "Остановка"):
+            send(chat, "Выберите действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
+            return
+        data["action"] = "запуск" if text == "Запуск" else "остановка"
 
-            if data["action"] == "запуск":
-                st["step"] = "znp_prefix"
-                curr = datetime.now().strftime("%m%y")
-                prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
-                kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
-                send(chat, "Префикс ЗНП:", keyboard(kb)); return
+        if data["action"] == "запуск":
+            st["step"] = "znp_prefix"
+            curr = datetime.now().strftime("%m%y")
+            prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
+            kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+            send(chat, "Выберите префикс ЗНП:", keyboard(kb))
+            return
 
-            st["step"] = "reason"
-            reasons = get_reasons()
-            rows = [reasons[i:i+2] for i in range(0, len(reasons), 2)]
-            rows.append(["Другое", "Отмена"])
-            send(chat, "Причина остановки:", keyboard(rows)); return
+        # Остановка → причины
+        st["step"] = "reason"
+        reasons = get_reasons()
+        rows = [reasons[i:i+2] for i in range(0, len(reasons), 2)]
+        rows.append(["Другое", "Отмена"])
+        send(chat, "Причина остановки:", keyboard(rows))
+        return
 
-        # -------------------------- REASON --------------------------
-        if step == "reason":
-            reasons = get_reasons()
-            if text == "Другое":
-                st["step"] = "reason_custom"
-                send(chat, "Введите причину:", CANCEL_KB); return
-            if text in reasons:
-                data["reason"] = text
-                st["step"] = "znp_prefix"
-                curr = datetime.now().strftime("%m%y")
-                prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
-                kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
-                send(chat, "Префикс ЗНП:", keyboard(kb)); return
-            rows = [reasons[i:i+2] for i in range(0, len(reasons), 2)]
-            rows.append(["Другое", "Отмена"])
-            send(chat, "Выберите из списка:", keyboard(rows)); return
-
-        if step == "reason_custom":
+    # -------------------------- REASON --------------------------
+    if step == "reason":
+        reasons = get_reasons()
+        if text == "Другое":
+            st["step"] = "reason_custom"
+            send(chat, "Введите причину остановки:", CANCEL_KB)
+            return
+        if text in reasons:
             data["reason"] = text
             st["step"] = "znp_prefix"
             curr = datetime.now().strftime("%m%y")
             prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
             kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
-            send(chat, "Префикс ЗНП:", keyboard(kb)); return
+            send(chat, "Выберите префикс ЗНП:", keyboard(kb))
+            return
+        rows = [reasons[i:i+2] for i in range(0, len(reasons), 2)]
+        rows.append(["Другое", "Отмена"])
+        send(chat, "Выберите из списка:", keyboard(rows))
+        return
 
-        # -------------------------- ZNP (общий для Запуска и Остановки) --------------------------
-        if step == "znp_prefix":
-            now = datetime.now()
-            curr = now.strftime("%m%y")
-            prev = (now - timedelta(days=32)).strftime("%m%y")
-            valid = [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]
+    if step == "reason_custom":
+        data["reason"] = text
+        st["step"] = "znp_prefix"
+        curr = datetime.now().strftime("%m%y")
+        prev = (datetime.now() - timedelta(days=32)).strftime("%m%y")
+        kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+        send(chat, "Выберите префикс ЗНП:", keyboard(kb))
+        return
 
-            if text.isdigit() and len(text) == 4 and "znp_prefix" in data:
-                data["znp"] = f"{data['znp_prefix']}-{text}"
-                st["step"] = "meters"
-                send(chat, "Метров брака:", CANCEL_KB); return
+    # -------------------------- ZNP PREFIX --------------------------
+    if step == "znp_prefix":
+        now = datetime.now()
+        curr = now.strftime("%m%y")
+        prev = (now - timedelta(days=32)).strftime("%m%y")
+        valid_prefixes = [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]
 
-            if text in valid:
-                data["znp_prefix"] = text
-                send(chat, f"Введите последние 4 цифры для <b>{text}</b>:", CANCEL_KB); return
+        if text.isdigit() and len(text) == 4 and "znp_prefix" in data:
+            data["znp"] = f"{data['znp_prefix']}-{text}"
+            st["step"] = "meters"
+            send(chat, "Метров брака:", CANCEL_KB)
+            return
 
-            if text == "Другое":
-                st["step"] = "znp_manual"
-                send(chat, "Введите полный ЗНП (D1125-5678):", CANCEL_KB); return
+        if text in valid_prefixes:
+            data["znp_prefix"] = text
+            send(chat, f"Введите последние 4 цифры для <b>{text}</b>:", CANCEL_KB)
+            return
 
-            kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
-            send(chat, "Выберите префикс:", keyboard(kb)); return
+        if text == "Другое":
+            st["step"] = "znp_full_manual"
+            send(chat, "Введите полный ЗНП (например D1125-5678):", CANCEL_KB)
+            return
 
-        if step == "znp_manual":
-            if len(text) == 10 and text[0] in ("D","L") and text[5] == "-" and text[1:5].isdigit() and text[6:].isdigit():
-                data["znp"] = text.upper()
-                st["step"] = "meters"
-                send(chat, "Метров брака:", CANCEL_KB); return
-            send(chat, "Неверный формат. Пример: <code>D1125-5678</code>", CANCEL_KB); return
+        kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+        send(chat, "Выберите префикс ЗНП:", keyboard(kb))
+        return
 
-        # -------------------------- METERS --------------------------
-        if step == "meters":
-            if not text.isdigit():
-                send(chat, "Введите количество метров:", CANCEL_KB); return
-            data["meters"] = text
-            st["step"] = "defect"
-            defects = get_defect_types()
+    if step == "znp_full_manual":
+        if len(text) == 10 and text[0] in ("D","L") and text[5] == "-" and text[1:5].isdigit() and text[6:].isdigit():
+            data["znp"] = text.upper()
+            st["step"] = "meters"
+            send(chat, "Метров брака:", CANCEL_KB)
+            return
+        send(chat, "Неверный формат. Пример: <code>D1125-5678</code>", CANCEL_KB)
+        return
+
+    # -------------------------- METERS --------------------------
+    if step == "meters":
+        if not text.isdigit():
+            send(chat, "Введите число метров брака:", CANCEL_KB)
+            return
+        data["meters"] = text
+        st["step"] = "defect"
+        defects = get_defects()
+        rows = [defects[i:i+2] for i in range(0, len(defects), 2)]
+        rows.append(["Нет брака"])
+        rows.append(["Другое", "Отмена"])
+        send(chat, "Вид брака:", keyboard(rows))
+        return
+
+    # -------------------------- DEFECT (Вид брака) --------------------------
+    if step == "defect":
+        defects = get_defects()
+        if text == "Нет брака":
+            data["defect"] = ""
+        elif text == "Другое":
+            st["step"] = "defect_custom"
+            send(chat, "Введите вид брака вручную:", CANCEL_KB)
+            return
+        elif text in defects:
+            data["defect"] = text
+        else:
+            # если не в списке — показываем заново
             rows = [defects[i:i+2] for i in range(0, len(defects), 2)]
-            rows += [["Нет брака"], ["Другое", "Отмена"]]
-            send(chat, "Вид брака:", keyboard(rows)); return
-
-        # -------------------------- DEFECT --------------------------
-        if step == "defect":
-            defects = get_defect_types()
-            if text == "Нет брака":
-                data["defect"] = ""
-            elif text == "Другое":
-                st["step"] = "defect_custom"
-                send(chat, "Введите вид брака:", CANCEL_KB); return
-            elif text in defects:
-                data["defect"] = text
-            else:
-                rows = [defects[i:i+2] for i in range(0, len(defects), 2)]
-                rows += [["Нет брака"], ["Другое", "Отмена"]]
-                send(chat, "Выберите из списка:", keyboard(rows)); return
-
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            append_startstop({**data, "user": user_repr, "ts": ts})
-            send(chat,
-                 f"<b>Записано!</b>\n"
-                 f"Линия: {data['line']}\nДата: {data['date']}\nВремя: {data['time']}\n"
-                 f"Действие: {'Запуск' if data['action']=='запуск' else 'Остановка'}\n"
-                 f"Причина: {data.get('reason','—')}\nЗНП: <code>{data['znp']}</code>\n"
-                 f"Метров брака: {data['meters']}\nВид брака: {data.get('defect') or '—'}",
-                 MAIN_KB)
-            states.pop(uid, None)
+            rows.append(["Нет брака"])
+            rows.append(["Другое", "Отмена"])
+            send(chat, "Выберите вид брака:", keyboard(rows))
             return
 
-        if step == "defect_custom":
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            append_startstop({**data, "defect": text, "user": user_repr, "ts": ts})
-            send(chat, f"<b>Записано!</b>\nВид брака: {text}", MAIN_KB)
-            states.pop(uid, None)
-            return
+        # Финальная запись
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        append_row({
+            "date": data["date"], "time": data["time"], "line": data["line"],
+            "action": data["action"], "reason": data.get("reason", ""),
+            "znp": data["znp"], "meters": data["meters"],
+            "defect": data.get("defect", ""), "user": user_repr, "ts": ts
+        })
 
+        defect_text = data.get("defect", "") or "—"
+        send(chat,
+             f"<b>Записано!</b>\n"
+             f"Дата: {data['date']}\nВремя: {data['time']}\nЛиния: {data['line']}\n"
+             f"Действие: {'Запуск' if data['action']=='запуск' else 'Остановка'}\n"
+             f"Причина: {data.get('reason','—')}\nЗНП: <code>{data['znp']}</code>\n"
+             f"Метров брака: {data['meters']}\nВид брака: {defect_text}",
+             MAIN_KB)
+        states.pop(uid, None)
+        return
+
+    if step == "defect_custom":
+        data["defect"] = text
+        # сразу записываем
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        append_row({
+            "date": data["date"], "time": data["time"], "line": data["line"],
+            "action": data["action"], "reason": data.get("reason", ""),
+            "znp": data["znp"], "meters": data["meters"],
+            "defect": text, "user": user_repr, "ts": ts
+        })
+        send(chat,
+             f"<b>Записано!</b>\n"
+             f"Дата: {data['date']}\nВремя: {data['time']}\nЛиния: {data['line']}\n"
+             f"Действие: {'Запуск' if data['action']=='запуск' else 'Остановка'}\n"
+             f"Причина: {data.get('reason','—')}\nЗНП: <code>{data['znp']}</code>\n"
+             f"Метров брака: {data['meters']}\nВид брака: {text}",
+             MAIN_KB)
+        states.pop(uid, None)
+        return
 # -----------------------------------------------------------------------------
 # Flask
 # -----------------------------------------------------------------------------
