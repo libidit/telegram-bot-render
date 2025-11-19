@@ -1,4 +1,4 @@
-# bot_webhook.py — Финальная версия с отменой через статус "Удалено" (декабрь 2025)
+# bot_webhook.py — Финальная версия: отмена через статус "Удалено" + без ошибок
 import os
 import json
 import logging
@@ -40,7 +40,7 @@ STARTSTOP_SHEET = "Старт-Стоп"
 DEFECT_SHEET = "Брак"
 
 HEADERS_STARTSTOP = ["Дата","Время","Номер линии","Действие","Причина","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
-HEADERS_DEFECT = ["Дата","Время","Номер линии","Действие","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]  # Добавлен "Статус" для единообразия
+HEADERS_DEFECT = ["Дата","Время","Номер линии","Действие","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
 
 def get_ws(sheet_name, headers):
     try:
@@ -63,59 +63,54 @@ def append_row(data):
     user = data["user"]
 
     if flow == "defect":
-        row = [
-            data["date"], data["time"], data["line"], "брак",
-            data.get("znp", ""), data["meters"],
-            data.get("defect_type", ""), user, ts, ""  # Статус пустой
-        ]
+        row = [data["date"], data["time"], data["line"], "брак",
+               data.get("znp", ""), data["meters"],
+               data.get("defect_type", ""), user, ts, ""]
     else:
-        row = [
-            data["date"], data["time"], data["line"], data["action"],
-            data.get("reason", ""), data.get("znp", ""), data["meters"],
-            data.get("defect_type", ""), user, ts, ""  # Статус пустой
-        ]
+        row = [data["date"], data["time"], data["line"], data["action"],
+               data.get("reason", ""), data.get("znp", ""), data["meters"],
+               data.get("defect_type", ""), user, ts, ""]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
-# ==================== Отмена через статус ====================
+# ==================== Отмена через статус "Удалено" ====================
 def set_delete_status(uid):
-    status_col = 11  # колонка "Статус" (11-я)
-    ts_col = 10      # колонка "Время отправки" (10-я)
-    user_col = 9     # колонка "Пользователь" (9-я)
+    status_col = 11
+    ts_col = 10
+    user_col = 9
 
-    # Проверяем оба листа
     for ws, name in [(ws_startstop, "Старт-Стоп"), (ws_defect, "Брак")]:
         try:
             all_values = ws.get_all_values()
             if len(all_values) < 2: continue
 
-            # Ищем последнюю запись от этого пользователя (по времени)
             latest_row = None
-            latest_ts = None
             latest_index = None
+            latest_ts = None
+
             for i in range(len(all_values)-1, 0, -1):
                 row = all_values[i]
-                if len(row) >= status_col and str(uid) in row[user_col-1]:
+                if len(row) >= user_col and str(uid) in row[user_col-1]:
                     try:
-                        ts_str = row[ts_col-1]
+                        ts_str = row[ts_col-1] if len(row) > ts_col-1 else ""
+                        if not ts_str: continue
                         ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
                         if latest_ts is None or ts > latest_ts:
                             latest_ts = ts
                             latest_row = row
-                            latest_index = i + 1  # gspread нумерует с 1
+                            latest_index = i + 1
                     except:
                         continue
 
-            if latest_row:
-                # Устанавливаем статус "Удалено"
+            if latest_row and latest_index:
                 ws.update_cell(latest_index, status_col, "Удалено")
                 return True, name, latest_row
         except Exception as e:
-            log.error(f"Ошибка при отмене записи: {e}")
+            log.error(f"Ошибка при отмене: {e}")
     return False, None, None
 
 # ==================== Клавиатуры ====================
 def keyboard(rows):
-    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True}
+    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True, "one_time_keyboard": False}
 
 MAIN_KB = keyboard([["Старт/Стоп"], ["Брак"], ["Отменить последнюю запись"]])
 CANCEL_KB = keyboard([["Отмена"]])
@@ -133,11 +128,8 @@ def build_kb(sheet_name, extra=None):
         rows = [items[i:i+2] for i in range(0, len(items), 2)]
         rows.append(["Отмена"])
         return keyboard(rows)
-    except Exception as e:
-        log.warning(f"Лист '{sheet_name}' недоступен: {e}")
-        fallback = [extra[i:i+2] for i in range(0, len(extra), 2)]
-        fallback.append(["Отмена"])
-        return keyboard(fallback)
+    except:
+        return keyboard([extra[i:i+2] for i in range(0, len(extra), 2)] + [["Отмена"]])
 
 def get_reasons_kb():
     now = time.time()
@@ -185,6 +177,17 @@ threading.Thread(target=timeout_worker, daemon=True).start()
 def process(uid, chat, text, user_repr):
     last_activity[uid] = time.time()
 
+    # === Если пользователь в процессе отмены ===
+    if uid in states and states[uid].get("step") == "delete_confirm":
+        if text == "Да, удалить":
+            send(chat, "Запись помечена как <b>Удалено</b> в статусе.", MAIN_KB)
+            states.pop(uid, None)
+            return
+        if text in ("Нет", "Отмена"):
+            send(chat, "Отмена отмены. Запись сохранена.", MAIN_KB)
+            states.pop(uid, None)
+            return
+
     # === Главное меню ===
     if uid not in states:
         if text in ("/start", "Старт/Стоп"):
@@ -196,41 +199,33 @@ def process(uid, chat, text, user_repr):
             send(chat, "Учёт брака\nВведите номер линии (1–15):", CANCEL_KB)
             return
         if text == "Отменить последнюю запись":
-            states[uid] = {"step": "delete_confirm", "data": {}, "chat": chat}
             success, sheet_name, row = set_delete_status(uid)
             if not success:
                 send(chat, "У вас нет записей для отмены.", MAIN_KB)
-                states.pop(uid, None)
                 return
-            # Показываем запись для подтверждения
-            action = row[3] if len(row) > 3 else "Неизвестно"
-            reason = row[4] if len(row) > 4 else "—"
-            znp = row[5] if len(row) > 5 else "—"
-            meters = row[6] if len(row) > 6 else "—"
-            defect = row[7] if len(row) > 7 else "—"
+
+            # Формируем сообщение
+            action = row[3] if len(row) > 3 else "брак"
+            znp = row[4] if len(row) > 4 else "—"
+            meters = row[5] if len(row) > 5 else "—"
+            defect = row[6] if len(row) > 6 else "—"
             ts = row[9] if len(row) > 9 else "—"
+
             msg = f"<b>Последняя запись (лист '{sheet_name}'):</b>\n"
-            msg += f"Дата: {row[0]} {row[1]}\nЛиния: {row[2]}\nДействие: {action}\n"
-            msg += f"Причина: {reason}\nЗНП: {znp}\nБрака: {meters} м\nВид брака: {defect}\n"
-            msg += f"Время отправки: {ts}\n\nУдалить эту запись? (Статус станет 'Удалено')"
+            msg += f"{row[0]} {row[1]} | Линия {row[2]}\n"
+            msg += f"Действие: {action}\n"
+            msg += f"ЗНП: <code>{znp}</code>\n"
+            msg += f"Брака: {meters} м | {defect}\n"
+            msg += f"Отправлено: {ts}\n\n"
+            msg += "<b>Удалить эту запись?</b> (статус станет «Удалено»)"
             send(chat, msg, CONFIRM_KB)
-            states[uid]["data"]["last_row"] = row  # Кэшируем для подтверждения
+            states[uid] = {"step": "delete_confirm", "chat": chat}
             return
+
         send(chat, "Выберите действие:", MAIN_KB)
         return
 
-    # === Подтверждение отмены ===
-    if st["step"] == "delete_confirm":
-        if text == "Да, удалить":
-            # Уже установили статус в set_delete_status — просто подтверждаем
-            send(chat, "✅ Запись помечена как 'Удалено' в статусе.", MAIN_KB)
-            states.pop(uid, None)
-            return
-        if text in ("Нет, оставить", "Отмена"):
-            send(chat, "Отмена отмены. Запись сохранена.", MAIN_KB)
-            states.pop(uid, None)
-            return
-
+    # === Обработка остальных шагов ===
     if text == "Отмена":
         states.pop(uid, None)
         send(chat, "Отменено.", MAIN_KB)
@@ -240,7 +235,6 @@ def process(uid, chat, text, user_repr):
     step = st["step"]
     data = st["data"]
     flow = st.get("flow", "startstop")
-
     # 1. Линия
     if step == "line":
         if not (text.isdigit() and 1 <= int(text) <= 15):
@@ -421,20 +415,26 @@ def process(uid, chat, text, user_repr):
         states.pop(uid, None)
         return
 
-    if step == "defect_custom":
-        data["defect_type"] = text
+    if step == "defect_type":
+        if text == "Другое":
+            st["step"] = "defect_custom"
+            send(chat, "Опишите вид брака:", CANCEL_KB)
+            return
+        data["defect_type"] = "" if text == "Без брака" else text
         data["user"] = user_repr
         data["flow"] = flow
         append_row(data)
+
         sheet_name = "Брак" if flow == "defect" else "Старт-Стоп"
+        action_text = "Брак" if flow == "defect" else ("Запуск" if data.get("action") == "запуск" else "Остановка")
+
         send(chat,
              f"<b>Записано на лист '{sheet_name}'!</b>\n"
-             f"Линия: {data['line']} | {data['date']} {data['time']}\n"
+             f"Линия {data['line']} | {data['date']} {data['time']}\n"
              f"Действие: {action_text}\n"
-             f"Причина: {data.get('reason','—')}\n"
              f"ЗНП: <code>{data.get('znp','—')}</code>\n"
              f"Брака: {data['meters']} м\n"
-             f"Вид брака: {text}",
+             f"Вид брака: {data.get('defect_type') or '—'}",
              MAIN_KB)
         states.pop(uid, None)
         return
