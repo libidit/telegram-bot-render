@@ -84,13 +84,14 @@ def init_gsheets():
         else:
             # попытка найти любой .json в /etc/secrets
             if os.path.isdir(SECRETS_DIR):
+                path = None
                 for fname in os.listdir(SECRETS_DIR):
                     if fname.lower().endswith(".json"):
                         path = os.path.join(SECRETS_DIR, fname)
                         log.info(f"Найден JSON файл секретов: {path}, попробую использовать его")
                         gc = gspread.service_account(filename=path)
                         break
-                else:
+                if not path:
                     raise RuntimeError("Нужно задать GOOGLE_CREDS_JSON или GOOGLE_CREDS_PATH")
             else:
                 raise RuntimeError("Нужно задать GOOGLE_CREDS_JSON или GOOGLE_CREDS_PATH")
@@ -103,42 +104,94 @@ def init_gsheets():
 sh = init_gsheets()
 
 # ----------------------------
-# Helper to get or create worksheet by name (tries a few common names)
+# Config for StartStop sheet
 # ----------------------------
-def get_or_create_ws(workbook, names):
-    """
-    names: list of possible sheet names in order of preference
-    returns first found worksheet or creates workbook.worksheet(names[0]) if none found.
-    """
-    for name in names:
-        try:
-            ws = workbook.worksheet(name)
-            log.info(f"Использую лист '{name}'")
-            return ws
-        except Exception:
-            continue
-    # None found: create first name
+STARTSTOP_SHEET_NAME = 'Старт-Стоп'
+HEADERS_STARTSTOP = ['Дата', 'Время', 'Номер линии', 'Действие', 'Причина', 'Пользователь', 'Время отправки', 'Статус']
+
+# ----------------------------
+# Worksheet helpers
+# ----------------------------
+def get_or_create_ws_by_name(workbook, name):
     try:
-        ws = workbook.add_worksheet(title=names[0], rows=1000, cols=20)
-        log.info(f"Создан лист '{names[0]}'")
+        ws = workbook.worksheet(name)
+        log.info(f"Использую лист '{name}'")
         return ws
     except Exception:
-        # fallback to default sheet
-        ws = workbook.sheet1
-        log.warning(f"Не удалось создать лист, использую первый лист книги: {ws.title}")
-        return ws
+        # create
+        try:
+            ws = workbook.add_worksheet(title=name, rows=1000, cols=len(HEADERS_STARTSTOP))
+            log.info(f"Создан лист '{name}'")
+            return ws
+        except Exception as e:
+            log.exception(f"Не удалось создать лист '{name}', использую первый лист")
+            return workbook.sheet1
 
-# For start/stop we accept variants 'Старт-Стоп' and 'Стар/Стоп' and also SHEET_NAME
-STARTSTOP_SHEET_NAMES = [SHEET_NAME, 'Старт-Стоп', 'Стар/Стоп', 'Start-Stop']
-startstop_ws = get_or_create_ws(sh, STARTSTOP_SHEET_NAMES)
+def ensure_headers(ws, headers):
+    """
+    Ensure first row equals headers.
+    - If first row empty -> insert headers.
+    - If first row differs and sheet has only header/empty rows -> replace.
+    - If differs and sheet has data -> do not modify (log warning).
+    """
+    try:
+        # get first row values
+        try:
+            current = ws.row_values(1)
+        except Exception:
+            current = []
+        # Normalize: strip strings
+        current_norm = [c.strip() if isinstance(c, str) else c for c in current]
+        headers_norm = [h for h in headers]
 
-# For reasons we expect sheet named 'Причина остановки' or 'Причины'
-REASONS_SHEET_NAMES = ['Причина остановки', 'Причины', 'Reasons']
-# Try to get reasons worksheet, if not found create an empty one
-try:
-    reasons_ws = get_or_create_ws(sh, REASONS_SHEET_NAMES)
-except Exception:
-    reasons_ws = None
+        # If first row empty or no values
+        if not current_norm or all((not str(c).strip()) for c in current_norm):
+            # insert headers at row 1
+            try:
+                ws.insert_row(headers_norm, index=1)
+                log.info("Вставлены заголовки в листе")
+            except Exception as e:
+                # fallback: update first row cells
+                try:
+                    ws.update('A1', [headers_norm])
+                    log.info("Заголовки записаны через update")
+                except Exception:
+                    log.exception("Не удалось записать заголовки")
+            return
+
+        # If existing equals desired -> ok
+        if current_norm == headers_norm:
+            return
+
+        # If differ but sheet has only header row (no data rows) or single-row -> replace
+        try:
+            all_values = ws.get_all_values()
+        except Exception:
+            all_values = []
+        data_rows_count = max(0, len(all_values) - 1)  # excluding header row
+        if data_rows_count == 0:
+            # Safe to replace header
+            try:
+                # delete first row then insert
+                ws.delete_rows(1)
+                ws.insert_row(headers_norm, index=1)
+                log.info("Заголовки заменены (лист не содержал данных)")
+            except Exception:
+                try:
+                    ws.update('A1', [headers_norm])
+                    log.info("Заголовки заменены через update")
+                except Exception:
+                    log.exception("Не удалось заменить заголовки")
+            return
+        else:
+            log.warning("Заголовки листа отличаются от ожидаемых, но лист содержит данные — не изменяю заголовки автоматически.")
+            return
+    except Exception:
+        log.exception("Ошибка при ensure_headers")
+
+# Prepare startstop worksheet and ensure headers
+startstop_ws = get_or_create_ws_by_name(sh, STARTSTOP_SHEET_NAME)
+ensure_headers(startstop_ws, HEADERS_STARTSTOP)
 
 # ----------------------------
 # Flask app and Telegram helpers
@@ -155,7 +208,6 @@ def send_message(chat_id, text, reply_to_message_id=None, reply_markup=None):
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
     if reply_markup:
-        # reply_markup should be a python dict -> JSON
         payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     try:
         resp = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=15)
@@ -165,36 +217,63 @@ def send_message(chat_id, text, reply_to_message_id=None, reply_markup=None):
         log.exception("Ошибка отправки сообщения в Telegram")
         return None
 
-def append_to_startstop_sheet(row):
+def append_to_startstop_sheet_by_headers(data_dict):
     """
-    Append a row to the start/stop worksheet.
-    Recommended row format: [date_display, time, line, action, reason, user_repr, timestamp]
+    data_dict expected keys: date_display, time, line, action, reason, user_repr, timestamp, status (optional)
+    This function writes values into columns according to HEADERS_STARTSTOP.
     """
     try:
+        # ensure headers exist before append (in case sheet was recreated)
+        ensure_headers(startstop_ws, HEADERS_STARTSTOP)
+        # build row in order of headers
+        row = []
+        for h in HEADERS_STARTSTOP:
+            if h == 'Дата':
+                row.append(data_dict.get('date_display', ''))
+            elif h == 'Время':
+                row.append(data_dict.get('time', ''))
+            elif h == 'Номер линии':
+                row.append(data_dict.get('line', ''))
+            elif h == 'Действие':
+                # write user-friendly action
+                action = data_dict.get('action', '')
+                row.append('Запуск' if action == 'запуск' else 'Остановка' if action == 'остановка' else action)
+            elif h == 'Причина':
+                row.append(data_dict.get('reason', ''))
+            elif h == 'Пользователь':
+                row.append(data_dict.get('user_repr', ''))
+            elif h == 'Время отправки':
+                row.append(data_dict.get('timestamp', ''))
+            elif h == 'Статус':
+                row.append(data_dict.get('status', ''))
+            else:
+                row.append(data_dict.get(h, ''))
         startstop_ws.append_row(row, value_input_option='USER_ENTERED')
-        log.info("Row appended to startstop sheet")
+        log.info("Запись добавлена в 'Старт-Стоп' (по заголовкам)")
     except Exception:
-        log.exception("Ошибка при append_row в startstop sheet")
+        log.exception("Ошибка при добавлении записи в лист 'Старт-Стоп'")
 
+# ----------------------------
+# Reasons sheet helper (existing behavior)
+# ----------------------------
 def load_reasons():
-    """
-    Load reasons from reasons_ws: read first column from row 2 downwards, skip empty.
-    Returns list of reasons (strings). If no worksheet or empty, returns ['Другое'].
-    """
     try:
-        if not reasons_ws:
-            return ['Другое']
-        values = reasons_ws.col_values(1)  # column A
-        # Skip header if present and blank entries
-        res = [v.strip() for v in values if v and v.strip()]
-        # If header exists and equals typical header words, remove it (heuristic)
-        if res and res[0].lower().startswith('прич') :
-            res = res[1:]
-        if not res:
-            return ['Другое']
-        if 'Другое' not in res:
-            res.append('Другое')
-        return res
+        # try to find worksheet with typical names
+        for name in ['Причина остановки', 'Причины', 'Reasons']:
+            try:
+                ws = sh.worksheet(name)
+                vals = ws.col_values(1)
+                res = [v.strip() for v in vals if v and v.strip()]
+                if res and res[0].lower().startswith('прич'):
+                    res = res[1:]
+                if not res:
+                    return ['Другое']
+                if 'Другое' not in res:
+                    res.append('Другое')
+                return res
+            except Exception:
+                continue
+        return ['Другое']
     except Exception:
         log.exception("Ошибка при загрузке причин")
         return ['Другое']
@@ -211,7 +290,6 @@ def keyboard_from_rows(rows, one_time=False, resize=True):
     return kb
 
 def main_menu_kb():
-    # three buttons, size by content -> one per row
     return keyboard_from_rows([["Старт/Стоп"], ["Брак"], ["Отменить последнюю запись"]])
 
 def cancel_kb():
@@ -228,7 +306,6 @@ def time_menu_kb():
     for mins in [0, 10, 20, 30]:
         t = (now - timedelta(minutes=mins)).strftime('%H:%M')
         times.append(t)
-    # split into two columns
     row1 = times[:2]
     row2 = times[2:]
     row1.append('Другое время')
@@ -239,10 +316,8 @@ def action_menu_kb():
     return keyboard_from_rows([["Запуск", "Остановка"], ["Отмена"]])
 
 def reasons_menu_kb(reasons_list):
-    # build rows of 2 per row (adjust visually)
     rows = []
     r = list(reasons_list)
-    # put 'Отмена' as last row
     if 'Другое' not in r:
         r.append('Другое')
     for i in range(0, len(r), 2):
@@ -253,7 +328,6 @@ def reasons_menu_kb(reasons_list):
 # ----------------------------
 # Conversation state
 # ----------------------------
-# user_states: uid -> dict with keys: flow, step, data
 user_states = {}
 
 def start_startstop_flow(uid, user_info, chat_id):
@@ -276,9 +350,8 @@ def cancel_flow(uid):
 def parse_date_input(s):
     try:
         d, m, y = map(int, s.split('.'))
-        # basic validation
         datetime(year=y, month=m, day=d)
-        return f"{y:04d}-{m:02d}-{d:02d}", s  # iso, display dd.mm.yyyy
+        return f"{y:04d}-{m:02d}-{d:02d}", s
     except Exception:
         return None, None
 
@@ -291,7 +364,7 @@ def validate_time_input(s):
     return False
 
 # ----------------------------
-# Flask webhook endpoint
+# Webhook endpoint
 # ----------------------------
 @app.route("/health")
 def health():
@@ -299,25 +372,19 @@ def health():
 
 @app.route(f"/webhook/<token>", methods=["POST"])
 def webhook(token):
-    # quick path token check
     if token != TELEGRAM_TOKEN:
         log.warning("Получён вебхук с неверным токеном в пути")
         abort(403)
-
     if request.headers.get("content-type") != "application/json":
         log.warning("Webhook: неверный content-type")
         abort(400)
-
     update = request.get_json()
     if not update:
         return jsonify({"ok": True})
-
     try:
         message = update.get("message") or update.get("edited_message")
         if not message:
-            # ignore other update types for now
             return jsonify({"ok": True})
-
         text = message.get("text", "").strip()
         chat = message.get("chat", {})
         from_user = message.get("from", {})
@@ -326,56 +393,42 @@ def webhook(token):
         username = from_user.get("username") or ""
         user_repr = f"{uid} (@{username or 'без_username'})"
 
-        # If no active conversation -> react to main menu buttons or commands
         if uid not in user_states:
-            # Handle main menu interactions
             if text == "Старт/Стоп":
-                # start flow
                 start_startstop_flow(uid, from_user, chat_id)
                 send_message(chat_id, "Номер линии (1-15):", reply_markup=cancel_kb())
                 return jsonify({"ok": True})
             elif text == "Брак":
-                # Not implemented yet (per request). Reply with stub.
                 send_message(chat_id, "Раздел «Брак» пока не реализован.", reply_markup=main_menu_kb())
                 return jsonify({"ok": True})
             elif text == "Отменить последнюю запись":
-                # Not implemented now — stub
                 send_message(chat_id, "Функция отмены пока не реализована.", reply_markup=main_menu_kb())
                 return jsonify({"ok": True})
             else:
-                # send main menu
                 send_message(chat_id, "Выберите действие:", reply_markup=main_menu_kb())
                 return jsonify({"ok": True})
 
-        # There is an active conversation
         state = user_states.get(uid)
         if not state or state.get("flow") != "startstop":
-            # unexpected, clear and show menu
             cancel_flow(uid)
             send_message(chat_id, "Произошла ошибка состояния. Начните заново.", reply_markup=main_menu_kb())
             return jsonify({"ok": True})
 
         step = state.get("step")
-
-        # Handle global cancel
         if text == "Отмена":
             cancel_flow(uid)
             send_message(chat_id, "Отменено.", reply_markup=main_menu_kb())
             return jsonify({"ok": True})
 
-        # Step: line
         if step == "line":
-            # expect integer 1..15
             if not text.isdigit() or not (1 <= int(text) <= 15):
                 send_message(chat_id, "Введите номер линии от 1 до 15 (целое число):", reply_markup=cancel_kb())
                 return jsonify({"ok": True})
             state["data"]["line"] = text
             state["step"] = "date"
-            # send date options
             send_message(chat_id, "Дата (дд.мм.гггг):", reply_markup=date_menu_kb())
             return jsonify({"ok": True})
 
-        # Step: date
         if step == "date":
             if text == "Другая дата":
                 send_message(chat_id, "Введите дату в формате дд.мм.гггг:", reply_markup=cancel_kb())
@@ -402,7 +455,6 @@ def webhook(token):
             send_message(chat_id, "Время (чч:мм):", reply_markup=time_menu_kb())
             return jsonify({"ok": True})
 
-        # Step: time
         if step == "time":
             if text == "Другое время":
                 send_message(chat_id, "Введите время в формате чч:мм:", reply_markup=cancel_kb())
@@ -425,7 +477,6 @@ def webhook(token):
             send_message(chat_id, "Действие:", reply_markup=action_menu_kb())
             return jsonify({"ok": True})
 
-        # Step: action
         if step == "action":
             if text not in ["Запуск", "Остановка"]:
                 send_message(chat_id, "Выберите действие: Запуск или Остановка", reply_markup=action_menu_kb())
@@ -433,24 +484,23 @@ def webhook(token):
             action = "запуск" if text == "Запуск" else "остановка"
             state["data"]["action"] = action
             if action == "запуск":
-                # finish flow: write to sheet and confirm
                 ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                row = [
-                    state["data"].get("date_display", ""),
-                    state["data"].get("time", ""),
-                    state["data"].get("line", ""),
-                    action,
-                    "",  # reason empty
-                    user_repr,
-                    ts
-                ]
-                append_to_startstop_sheet(row)
-                # send confirmation
+                data_dict = {
+                    "date_display": state["data"].get("date_display", ""),
+                    "time": state["data"].get("time", ""),
+                    "line": state["data"].get("line", ""),
+                    "action": action,
+                    "reason": "",
+                    "user_repr": user_repr,
+                    "timestamp": ts,
+                    "status": ""
+                }
+                append_to_startstop_sheet_by_headers(data_dict)
                 msg = (
                     "<b>Записано!</b>\n"
-                    f"<b>Дата:</b> {state['data'].get('date_display','')}\n"
-                    f"<b>Время:</b> {state['data'].get('time','')}\n"
-                    f"<b>Линия:</b> {state['data'].get('line','')}\n"
+                    f"<b>Дата:</b> {data_dict['date_display']}\n"
+                    f"<b>Время:</b> {data_dict['time']}\n"
+                    f"<b>Линия:</b> {data_dict['line']}\n"
                     f"<b>Действие:</b> {'Запуск'}\n"
                     f"<b>Причина:</b> —\n"
                     f"<b>Пользователь:</b> {user_repr}"
@@ -459,13 +509,11 @@ def webhook(token):
                 send_message(chat_id, msg, reply_markup=main_menu_kb())
                 return jsonify({"ok": True})
             else:
-                # Остановка -> ask for reason using reasons sheet
                 reasons = load_reasons()
                 state["step"] = "reason"
                 send_message(chat_id, "Причина остановки:", reply_markup=reasons_menu_kb(reasons))
                 return jsonify({"ok": True})
 
-        # Step: reason
         if step == "reason":
             reasons = load_reasons()
             if text == "Другое":
@@ -473,29 +521,28 @@ def webhook(token):
                 send_message(chat_id, "Введите причину остановки (текст):", reply_markup=cancel_kb())
                 return jsonify({"ok": True})
             if text not in reasons:
-                # treat as custom free text as well
                 state["data"]["reason"] = text
             else:
                 state["data"]["reason"] = text
-            # finish and write
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            row = [
-                state["data"].get("date_display", ""),
-                state["data"].get("time", ""),
-                state["data"].get("line", ""),
-                state["data"].get("action", ""),
-                state["data"].get("reason", ""),
-                user_repr,
-                ts
-            ]
-            append_to_startstop_sheet(row)
+            data_dict = {
+                "date_display": state["data"].get("date_display", ""),
+                "time": state["data"].get("time", ""),
+                "line": state["data"].get("line", ""),
+                "action": state["data"].get("action", ""),
+                "reason": state["data"].get("reason", ""),
+                "user_repr": user_repr,
+                "timestamp": ts,
+                "status": ""
+            }
+            append_to_startstop_sheet_by_headers(data_dict)
             msg = (
                 "<b>Записано!</b>\n"
-                f"<b>Дата:</b> {state['data'].get('date_display','')}\n"
-                f"<b>Время:</b> {state['data'].get('time','')}\n"
-                f"<b>Линия:</b> {state['data'].get('line','')}\n"
+                f"<b>Дата:</b> {data_dict['date_display']}\n"
+                f"<b>Время:</b> {data_dict['time']}\n"
+                f"<b>Линия:</b> {data_dict['line']}\n"
                 f"<b>Действие:</b> {'Остановка'}\n"
-                f"<b>Причина:</b> {state['data'].get('reason','')}\n"
+                f"<b>Причина:</b> {data_dict['reason']}\n"
                 f"<b>Пользователь:</b> {user_repr}"
             )
             cancel_flow(uid)
@@ -503,33 +550,32 @@ def webhook(token):
             return jsonify({"ok": True})
 
         if step == "reason_custom":
-            # free text reason
             state["data"]["reason"] = text
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            row = [
-                state["data"].get("date_display", ""),
-                state["data"].get("time", ""),
-                state["data"].get("line", ""),
-                state["data"].get("action", ""),
-                state["data"].get("reason", ""),
-                user_repr,
-                ts
-            ]
-            append_to_startstop_sheet(row)
+            data_dict = {
+                "date_display": state["data"].get("date_display", ""),
+                "time": state["data"].get("time", ""),
+                "line": state["data"].get("line", ""),
+                "action": state["data"].get("action", ""),
+                "reason": state["data"].get("reason", ""),
+                "user_repr": user_repr,
+                "timestamp": ts,
+                "status": ""
+            }
+            append_to_startstop_sheet_by_headers(data_dict)
             msg = (
                 "<b>Записано!</b>\n"
-                f"<b>Дата:</b> {state['data'].get('date_display','')}\n"
-                f"<b>Время:</b> {state['data'].get('time','')}\n"
-                f"<b>Линия:</b> {state['data'].get('line','')}\n"
+                f"<b>Дата:</b> {data_dict['date_display']}\n"
+                f"<b>Время:</b> {data_dict['time']}\n"
+                f"<b>Линия:</b> {data_dict['line']}\n"
                 f"<b>Действие:</b> {'Остановка'}\n"
-                f"<b>Причина:</b> {state['data'].get('reason','')}\n"
+                f"<b>Причина:</b> {data_dict['reason']}\n"
                 f"<b>Пользователь:</b> {user_repr}"
             )
             cancel_flow(uid)
             send_message(chat_id, msg, reply_markup=main_menu_kb())
             return jsonify({"ok": True})
 
-        # default fallback
         cancel_flow(uid)
         send_message(chat_id, "Произошла ошибка. Начните заново.", reply_markup=main_menu_kb())
         return jsonify({"ok": True})
