@@ -1,6 +1,6 @@
 # bot_webhook.py — Clean architecture + FileLock (workers=2) + strict ordering + 10 min timeout
 # Author: Grok (adapted), 2025
-# Optimized for Render.com with GOOGLE_CREDS_JSON as dict
+# Optimized for Render.com with GOOGLE_CREDS_JSON as dict + ZNP with prefix + dash
 
 import os
 import json
@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
 import gspread
-from google.oauth2 import service_account  # Added for Credentials.from_service_account_info
+from google.oauth2 import service_account
 from filelock import FileLock
 
 # -----------------------------------------------------------------------------
@@ -34,7 +34,7 @@ if not TELEGRAM_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
 # Parse JSON creds to dict
 creds_dict = json.loads(GOOGLE_CREDS_JSON)
 
-# Create credentials from dict (no file needed)
+# Create credentials from dict
 scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -44,7 +44,7 @@ creds = service_account.Credentials.from_service_account_info(creds_dict, scopes
 # -----------------------------------------------------------------------------
 # Google Sheets
 # -----------------------------------------------------------------------------
-gc = gspread.authorize(creds)  # Use authorize with creds object
+gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
 STARTSTOP_SHEET_NAME = "Старт-Стоп"
@@ -289,8 +289,16 @@ def process_step(uid, chat, text, user_repr):
         data["action"] = "запуск" if text == "Запуск" else "остановка"
 
         if data["action"] == "запуск":
-            st["step"] = "znp"
-            send(chat, "Введите номер ЗНП (4 цифры):", CANCEL_KB)
+            st["step"] = "znp_prefix"
+            now = datetime.now()
+            curr = now.strftime("%m%y")
+            prev = (now - timedelta(days=32)).strftime("%m%y")
+            kb = [
+                [f"D{curr}", f"L{curr}"],
+                [f"D{prev}", f"L{prev}"],
+                ["Другое", "Отмена"]
+            ]
+            send(chat, "Выберите префикс ЗНП:", keyboard(kb))
             return
 
         # Остановка → причина
@@ -308,8 +316,16 @@ def process_step(uid, chat, text, user_repr):
             return
 
         data["reason"] = text
-        st["step"] = "znp"
-        send(chat, "Введите номер ЗНП (4 цифры):", CANCEL_KB)
+        st["step"] = "znp_prefix"
+        now = datetime.now()
+        curr = now.strftime("%m%y")
+        prev = (now - timedelta(days=32)).strftime("%m%y")
+        kb = [
+            [f"D{curr}", f"L{curr}"],
+            [f"D{prev}", f"L{prev}"],
+            ["Другое", "Отмена"]
+        ]
+        send(chat, "Выберите префикс ЗНП:", keyboard(kb))
         return
 
     # -------------------------------------------------------------------------
@@ -317,22 +333,70 @@ def process_step(uid, chat, text, user_repr):
     # -------------------------------------------------------------------------
     if step == "reason_custom":
         data["reason"] = text
-        st["step"] = "znp"
-        send(chat, "Введите номер ЗНП (4 цифры):", CANCEL_KB)
+        st["step"] = "znp_prefix"
+        now = datetime.now()
+        curr = now.strftime("%m%y")
+        prev = (now - timedelta(days=32)).strftime("%m%y")
+        kb = [
+            [f"D{curr}", f"L{curr}"],
+            [f"D{prev}", f"L{prev}"],
+            ["Другое", "Отмена"]
+        ]
+        send(chat, "Выберите префикс ЗНП:", keyboard(kb))
         return
 
     # -------------------------------------------------------------------------
-    # Step: znp
+    # Step: znp_prefix — выбор префикса D/L + месяц
     # -------------------------------------------------------------------------
-    if step == "znp":
-        if not (text.isdigit() and len(text) == 4):
-            send(chat, "Введите номер ЗНП (4 цифры):", CANCEL_KB)
+    if step == "znp_prefix":
+        now = datetime.now()
+        curr = now.strftime("%m%y")
+        prev = (now - timedelta(days=32)).strftime("%m%y")
+        valid_prefixes = [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]
+
+        # Если ввёл 4 цифры — считаем, что это суффикс
+        if text.isdigit() and len(text) == 4:
+            prefix = data.get("znp_prefix", "")
+            if prefix in valid_prefixes:
+                data["znp"] = f"{prefix}-{text}"  # ← Дефис!
+                st["step"] = "meters"
+                send(chat, "Метров брака:", CANCEL_KB)
+                return
+
+        # Если выбрал префикс
+        if text in valid_prefixes:
+            data["znp_prefix"] = text
+            send(chat, f"Введите последние 4 цифры для <b>{text}</b>:", CANCEL_KB)
             return
 
-        data["znp"] = text
-        st["step"] = "meters"
-        send(chat, "Метров брака:", CANCEL_KB)
+        # Если нажал «Другое» — полный ручной ввод
+        if text == "Другое":
+            st["step"] = "znp_full_manual"
+            send(chat, "Введите полный ЗНП (например D1125-5678):", CANCEL_KB)
+            return
+
+        # Если ошибка — показываем клавиатуру снова
+        kb = [
+            [f"D{curr}", f"L{curr}"],
+            [f"D{prev}", f"L{prev}"],
+            ["Другое", "Отмена"]
+        ]
+        send(chat, "Выберите префикс ЗНП:", keyboard(kb))
         return
+
+    # -------------------------------------------------------------------------
+    # Step: znp_full_manual — полный ручной ввод
+    # -------------------------------------------------------------------------
+    if step == "znp_full_manual":
+        # Пример: D1125-5678
+        if len(text) == 10 and text[0] in ("D", "L") and text[5] == "-" and text[1:5].isdigit() and text[6:].isdigit():
+            data["znp"] = text.upper()
+            st["step"] = "meters"
+            send(chat, "Метров брака:", CANCEL_KB)
+            return
+        else:
+            send(chat, "Неверный формат. Пример: <code>D1125-5678</code>", CANCEL_KB)
+            return
 
     # -------------------------------------------------------------------------
     # Step: meters (final step)
@@ -364,7 +428,7 @@ def process_step(uid, chat, text, user_repr):
              f"Линия: {data['line']}\n"
              f"Действие: {'Запуск' if data['action']=='запуск' else 'Остановка'}\n"
              f"Причина: {data.get('reason','—')}\n"
-             f"ЗНП: {data['znp']}\n"
+             f"ЗНП: <code>{data['znp']}</code>\n"
              f"Метров брака: {data['meters']}",
              MAIN_KB)
 
@@ -399,9 +463,6 @@ def webhook():
     text = (msg.get("text") or "").strip()
     user_repr = f"{uid} (@{msg['from'].get('username', '') or 'без_username'})"
 
-    # -------------------------------
-    # STRICT ORDER GUARANTEED HERE
-    # -------------------------------
     with FileLock(LOCK_PATH):
         process_step(uid, chat, text, user_repr)
 
@@ -409,6 +470,5 @@ def webhook():
 
 
 if __name__ == "__main__":
-    # Fallback for local dev; Render uses gunicorn
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
