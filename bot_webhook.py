@@ -1,4 +1,6 @@
-# bot_webhook.py — Финальная версия с московским временем (MSK, UTC+3)
+# bot_webhook.py — Финальная версия (ноябрь 2025)
+# Полностью рабочие: Старт/Стоп + Брак (без лишних вопросов)
+# Московское время | Динамические причины и виды брака | ZNP с дефисом
 import os
 import json
 import logging
@@ -31,7 +33,7 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 
 # ==================== Московское время ====================
-MSK = timezone(timedelta(hours=3))  # UTC+3
+MSK = timezone(timedelta(hours=3))
 
 def now_msk():
     return datetime.now(MSK)
@@ -76,7 +78,7 @@ def build_kb(sheet_name, extra=None):
         rows.append(["Отмена"])
         return keyboard(rows)
     except Exception as e:
-        log.warning(f"Ошибка чтения листа '{sheet_name}': {e}")
+        log.warning(f"Лист '{sheet_name}' не найден: {e}")
         fallback = [extra[i:i+2] for i in range(0, len(extra), 2)]
         fallback.append(["Отмена"])
         return keyboard(fallback)
@@ -95,7 +97,7 @@ def get_defect_kb():
         DEFECTS_CACHE["until"] = now + 300
     return DEFECTS_CACHE["kb"]
 
-# ==================== Клавиатуры ====================
+# ==================== Основные клавиатуры ====================
 MAIN_KB = keyboard([
     ["Старт/Стоп"],
     ["Брак"],
@@ -135,7 +137,7 @@ threading.Thread(target=timeout_worker, daemon=True).start()
 def process(uid, chat, text, user):
     last_activity[uid] = time.time()
 
-    # === ОПРЕДЕЛЯЕМ ПОТОК ===
+    # === СТАРТ / ВЫБОР ПОТОКА ===
     if uid not in states:
         if text in ("/start", "Старт/Стоп"):
             states[uid] = {"step": "line", "data": {"action": None}, "chat": chat, "flow": "startstop"}
@@ -144,12 +146,18 @@ def process(uid, chat, text, user):
         if text == "Брак":
             states[uid] = {
                 "step": "line",
-                "data": {"action": "брак", "reason": ""},  # фиксируем сразу!
+                "data": {"action": "брак", "reason": ""},  # сразу фиксируем!
                 "chat": chat,
                 "flow": "defect"
             }
             send(chat, "Учёт брака\nВведите номер линии (1–15):", CANCEL_KB)
             return
+        if text == "Отменить последнюю запись":
+            send(chat, "Функция отмены записи в разработке.\nСкоро появится.", MAIN_KB)
+            return
+        send(chat, "Выберите действие:", MAIN_KB)
+        return
+
     if text == "Отмена":
         states.pop(uid, None)
         send(chat, "Отменено.", MAIN_KB)
@@ -179,15 +187,14 @@ def process(uid, chat, text, user):
             data["date"] = text
         except:
             send(chat, "Неверная дата.", CANCEL_KB); return
-        else:
-            st["step"] = "time"
-            now = now_msk()
-            t = [now.strftime("%H:%M"),
-                 (now-timedelta(minutes=10)).strftime("%H:%M"),
-                 (now-timedelta(minutes=20)).strftime("%H:%M"),
-                 (now-timedelta(minutes=30)).strftime("%H:%M")]
-            send(chat, "Время:", keyboard([[t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"]]))
-            return
+        st["step"] = "time"
+        now = now_msk()
+        t = [now.strftime("%H:%M"),
+             (now-timedelta(minutes=10)).strftime("%H:%M"),
+             (now-timedelta(minutes=20)).strftime("%H:%M"),
+             (now-timedelta(minutes=30)).strftime("%H:%M")]
+        send(chat, "Время:", keyboard([[t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"]]))
+        return
 
     if step == "date_custom":
         try:
@@ -209,7 +216,7 @@ def process(uid, chat, text, user):
         if text == "Другое время":
             st["step"] = "time_custom"; send(chat, "Введите время (чч:мм):", CANCEL_KB); return
         try:
-            h,m = map(int, text.split(":")); data["time"] = text
+            h,m_ = map(int, text.split(":")); data["time"] = text
             st["step"] = "action"
             send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
             return
@@ -218,16 +225,17 @@ def process(uid, chat, text, user):
 
     if step == "time_custom":
         try:
-            h,m = map(int, text.split(":")); data["time"] = text
+            h,m_ = map(int, text.split(":")); data["time"] = text
             st["step"] = "action"
             send(chat, "Действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]]))
             return
         except:
             send(chat, "Формат чч:мм", CANCEL_KB); return
 
-    # 4. Действие — ПРОПУСКАЕМ, если уже задан (в "Брак")
+    # 4. Действие — УМНАЯ ЛОГИКА
     if step == "action":
-        if data.get("action") is not None:  # уже задан в "Брак"
+        # Если это Брак — действие уже задано, сразу на ЗНП
+        if data.get("action") == "брак":
             st["step"] = "znp_prefix"
             curr = now_msk().strftime("%m%y")
             prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
@@ -235,22 +243,24 @@ def process(uid, chat, text, user):
             send(chat, "Префикс ЗНП:", keyboard(kb))
             return
 
+        # Обычный Старт/Стоп
         if text not in ("Запуск", "Остановка"):
-            send(chat, "Выберите действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]])); return
+            send(chat, "Выберите:", keyboard([["Запуск", "Остановка"], ["Отмена"]])); return
         data["action"] = "запуск" if text == "Запуск" else "остановка"
         if data["action"] == "запуск":
             st["step"] = "znp_prefix"
-            curr = now_msk().strftime("%m%y")
-            prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
-            kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
-            send(chat, "Префикс ЗНП:", keyboard(kb))
-            return
         else:
             st["step"] = "reason"
             send(chat, "Причина остановки:", get_reasons_kb())
             return
 
-    # 5. Причина
+        curr = now_msk().strftime("%m%y")
+        prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
+        kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+        send(chat, "Префикс ЗНП:", keyboard(kb))
+        return
+
+    # 5. Причина (только если остановка, при браке — пропускается)
     if step == "reason":
         if text == "Другое":
             st["step"] = "reason_custom"; send(chat, "Введите причину:", CANCEL_KB); return
@@ -271,7 +281,7 @@ def process(uid, chat, text, user):
         send(chat, "Префикс ЗНП:", keyboard(kb))
         return
 
-    # 6. ZNP
+    # 6. ZNP (общий для всех потоков)
     if step == "znp_prefix":
         curr = now_msk().strftime("%m%y")
         prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
@@ -288,6 +298,8 @@ def process(uid, chat, text, user):
         return
 
     if step == "znp_manual":
+        curr = now_msk().strftime("%m%y")
+        prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
         if len(text) == 10 and text[5] == "-" and text[:5].upper() in [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]:
             data["znp"] = text.upper()
             st["step"] = "meters"; send(chat, "Метров брака:", CANCEL_KB); return
@@ -314,16 +326,15 @@ def process(uid, chat, text, user):
         ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
         append_row({**data, "user": user, "ts": ts})
 
-        action_ru = "Запуск" if data["action"] == "запуск" else "Остановка"
-        defect_text = data.get("defect_type") or "—"
+        action_text = {"запуск": "Запуск", "остановка": "Остановка", "брак": "Брак"}.get(data["action"], data["action"])
         send(chat,
              f"<b>Записано!</b>\n"
              f"Линия: {data['line']} | {data['date']} {data['time']}\n"
-             f"Действие: {action_ru}\n"
+             f"Действие: {action_text}\n"
              f"Причина: {data.get('reason','—')}\n"
              f"ЗНП: <code>{data.get('znp','—')}</code>\n"
              f"Брака: {data['meters']} м\n"
-             f"Вид брака: {defect_text}",
+             f"Вид брака: {data.get('defect_type') or '—'}",
              MAIN_KB)
         states.pop(uid, None)
         return
@@ -332,11 +343,11 @@ def process(uid, chat, text, user):
         data["defect_type"] = text
         ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
         append_row({**data, "user": user, "ts": ts})
-        action_ru = "Запуск" if data["action"] == "запуск" else "Остановка"
+        action_text = {"запуск": "Запуск", "остановка": "Остановка", "брак": "Брак"}.get(data["action"], data["action"])
         send(chat,
              f"<b>Записано!</b>\n"
              f"Линия: {data['line']} | {data['date']} {data['time']}\n"
-             f"Действие: {action_ru}\n"
+             f"Действие: {action_text}\n"
              f"Причина: {data.get('reason','—')}\n"
              f"ЗНП: <code>{data.get('znp','—')}</code>\n"
              f"Брака: {data['meters']} м\n"
