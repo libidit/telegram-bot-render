@@ -91,7 +91,11 @@ threading.Thread(target=timeout_checker,daemon=True).start()
 def kb(rows):
     return {"keyboard":[[{"text":t} for t in r] for r in rows],"resize_keyboard":True}
 
-main_kb=kb([["Старт/Стоп"],["Брак"],["Отменить последнюю запись"]])
+main_kb = kb([
+    ["/start", "Старт/Стоп"],
+    ["Брак"],
+    ["Отменить последнюю запись"]
+])
 cancel_kb=kb([["Отмена"]])
 
 def process_update(update):
