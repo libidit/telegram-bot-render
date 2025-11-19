@@ -135,20 +135,21 @@ threading.Thread(target=timeout_worker, daemon=True).start()
 def process(uid, chat, text, user):
     last_activity[uid] = time.time()
 
+    # === ОПРЕДЕЛЯЕМ ПОТОК ===
     if uid not in states:
         if text in ("/start", "Старт/Стоп"):
-            states[uid] = {"step": "line", "data": {}, "chat": chat}
+            states[uid] = {"step": "line", "data": {"action": None}, "chat": chat, "flow": "startstop"}
             send(chat, "Введите номер линии (1–15):", CANCEL_KB)
             return
         if text == "Брак":
-            send(chat, "Функция учёта брака в разработке.\nСкоро будет доступна!", MAIN_KB)
+            states[uid] = {
+                "step": "line",
+                "data": {"action": "брак", "reason": ""},  # фиксируем сразу!
+                "chat": chat,
+                "flow": "defect"
+            }
+            send(chat, "Учёт брака\nВведите номер линии (1–15):", CANCEL_KB)
             return
-        if text == "Отменить последнюю запись":
-            send(chat, "Функция отмены записи в разработке.\nСкоро появится.", MAIN_KB)
-            return
-        send(chat, "Выберите действие:", MAIN_KB)
-        return
-
     if text == "Отмена":
         states.pop(uid, None)
         send(chat, "Отменено.", MAIN_KB)
@@ -224,8 +225,16 @@ def process(uid, chat, text, user):
         except:
             send(chat, "Формат чч:мм", CANCEL_KB); return
 
-    # 4. Действие
+    # 4. Действие — ПРОПУСКАЕМ, если уже задан (в "Брак")
     if step == "action":
+        if data.get("action") is not None:  # уже задан в "Брак"
+            st["step"] = "znp_prefix"
+            curr = now_msk().strftime("%m%y")
+            prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
+            kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+            send(chat, "Префикс ЗНП:", keyboard(kb))
+            return
+
         if text not in ("Запуск", "Остановка"):
             send(chat, "Выберите действие:", keyboard([["Запуск", "Остановка"], ["Отмена"]])); return
         data["action"] = "запуск" if text == "Запуск" else "остановка"
