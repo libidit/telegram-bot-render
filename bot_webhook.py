@@ -1,7 +1,6 @@
-
 # bot_webhook.py — Clean architecture + FileLock (workers=2) + strict ordering + 10 min timeout
-# Author: ChatGPT, 2025
-# This version is optimized for Render.com
+# Author: Grok (adapted from ChatGPT), 2025
+# This version is optimized for Render.com with GOOGLE_CREDS_JSON
 
 import os
 import json
@@ -9,6 +8,7 @@ import logging
 import requests
 import threading
 import time
+import io  # Added for StringIO
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
@@ -26,15 +26,19 @@ log = logging.getLogger("bot")
 # -----------------------------------------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")  # Changed to JSON string
 
-if not TELEGRAM_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDS_PATH:
-    raise RuntimeError("Missing environment variables")
+if not TELEGRAM_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
+    raise RuntimeError("Missing environment variables: TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON")
+
+# Parse JSON creds to file-like object
+creds_dict = json.loads(GOOGLE_CREDS_JSON)
+creds_file = io.StringIO(json.dumps(creds_dict))
 
 # -----------------------------------------------------------------------------
 # Google Sheets
 # -----------------------------------------------------------------------------
-gc = gspread.service_account(filename=GOOGLE_CREDS_PATH)
+gc = gspread.service_account(filename=creds_file)  # Use StringIO as file
 sh = gc.open_by_key(SPREADSHEET_ID)
 
 STARTSTOP_SHEET_NAME = "Старт-Стоп"
@@ -399,4 +403,10 @@ def webhook():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    # Use gunicorn for production (Render will override)
+    try:
+        from gunicorn.app.wsgiapp import run
+        run()
+    except ImportError:
+        app.run(host="0.0.0.0", port=port)
