@@ -1,11 +1,11 @@
-# bot_webhook.py — Полная рабочая версия (ноябрь 2025)
+# bot_webhook.py — Финальная версия с московским временем (MSK, UTC+3)
 import os
 import json
 import logging
 import requests
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request
 import gspread
 from google.oauth2 import service_account
@@ -29,6 +29,12 @@ creds = service_account.Credentials.from_service_account_info(
 
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
+
+# ==================== Московское время ====================
+MSK = timezone(timedelta(hours=3))  # UTC+3
+
+def now_msk():
+    return datetime.now(MSK)
 
 # ==================== Google Sheets ====================
 MAIN_SHEET = "Старт-Стоп"
@@ -129,7 +135,6 @@ threading.Thread(target=timeout_worker, daemon=True).start()
 def process(uid, chat, text, user):
     last_activity[uid] = time.time()
 
-    # Главное меню
     if uid not in states:
         if text in ("/start", "Старт/Стоп"):
             states[uid] = {"step": "line", "data": {}, "chat": chat}
@@ -159,8 +164,8 @@ def process(uid, chat, text, user):
             send(chat, "Номер линии 1–15:", CANCEL_KB); return
         data["line"] = text
         st["step"] = "date"
-        today = datetime.now().strftime("%d.%m.%Y")
-        yest = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
+        today = now_msk().strftime("%d.%m.%Y")
+        yest = (now_msk() - timedelta(days=1)).strftime("%d.%m.%Y")
         send(chat, "Дата:", keyboard([[today, yest], ["Другая дата", "Отмена"]]))
         return
 
@@ -175,10 +180,11 @@ def process(uid, chat, text, user):
             send(chat, "Неверная дата.", CANCEL_KB); return
         else:
             st["step"] = "time"
-            t = [datetime.now().strftime("%H:%M"),
-                 (datetime.now()-timedelta(minutes=10)).strftime("%H:%M"),
-                 (datetime.now()-timedelta(minutes=20)).strftime("%H:%M"),
-                 (datetime.now()-timedelta(minutes=30)).strftime("%H:%M")]
+            now = now_msk()
+            t = [now.strftime("%H:%M"),
+                 (now-timedelta(minutes=10)).strftime("%H:%M"),
+                 (now-timedelta(minutes=20)).strftime("%H:%M"),
+                 (now-timedelta(minutes=30)).strftime("%H:%M")]
             send(chat, "Время:", keyboard([[t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"]]))
             return
 
@@ -187,10 +193,11 @@ def process(uid, chat, text, user):
             d,m,y = map(int, text.split(".")); datetime(y,m,d)
             data["date"] = text
             st["step"] = "time"
-            t = [datetime.now().strftime("%H:%M"),
-                 (datetime.now()-timedelta(minutes=10)).strftime("%H:%M"),
-                 (datetime.now()-timedelta(minutes=20)).strftime("%H:%M"),
-                 (datetime.now()-timedelta(minutes=30)).strftime("%H:%M")]
+            now = now_msk()
+            t = [now.strftime("%H:%M"),
+                 (now-timedelta(minutes=10)).strftime("%H:%M"),
+                 (now-timedelta(minutes=20)).strftime("%H:%M"),
+                 (now-timedelta(minutes=30)).strftime("%H:%M")]
             send(chat, "Время:", keyboard([[t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"]]))
             return
         except:
@@ -224,8 +231,8 @@ def process(uid, chat, text, user):
         data["action"] = "запуск" if text == "Запуск" else "остановка"
         if data["action"] == "запуск":
             st["step"] = "znp_prefix"
-            curr = datetime.now().strftime("%m%y")
-            prev = (datetime.now() - timedelta(days=35)).strftime("%m%y")
+            curr = now_msk().strftime("%m%y")
+            prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
             kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
             send(chat, "Префикс ЗНП:", keyboard(kb))
             return
@@ -234,14 +241,14 @@ def process(uid, chat, text, user):
             send(chat, "Причина остановки:", get_reasons_kb())
             return
 
-    # 5. Причина (только при остановке)
+    # 5. Причина
     if step == "reason":
         if text == "Другое":
             st["step"] = "reason_custom"; send(chat, "Введите причину:", CANCEL_KB); return
         data["reason"] = text
         st["step"] = "znp_prefix"
-        curr = datetime.now().strftime("%m%y")
-        prev = (datetime.now() - timedelta(days=35)).strftime("%m%y")
+        curr = now_msk().strftime("%m%y")
+        prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
         kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
         send(chat, "Префикс ЗНП:", keyboard(kb))
         return
@@ -249,16 +256,16 @@ def process(uid, chat, text, user):
     if step == "reason_custom":
         data["reason"] = text
         st["step"] = "znp_prefix"
-        curr = datetime.now().strftime("%m%y")
-        prev = (datetime.now() - timedelta(days=35)).strftime("%m%y")
+        curr = now_msk().strftime("%m%y")
+        prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
         kb = [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
         send(chat, "Префикс ЗНП:", keyboard(kb))
         return
 
     # 6. ZNP
     if step == "znp_prefix":
-        curr = datetime.now().strftime("%m%y")
-        prev = (datetime.now() - timedelta(days=35)).strftime("%m%y")
+        curr = now_msk().strftime("%m%y")
+        prev = (now_msk() - timedelta(days=35)).strftime("%m%y")
         valid = [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]
         if text in valid:
             data["znp_prefix"] = text
@@ -295,7 +302,7 @@ def process(uid, chat, text, user):
         else:
             data["defect_type"] = text
 
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
         append_row({**data, "user": user, "ts": ts})
 
         action_ru = "Запуск" if data["action"] == "запуск" else "Остановка"
@@ -314,7 +321,7 @@ def process(uid, chat, text, user):
 
     if step == "defect_custom":
         data["defect_type"] = text
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
         append_row({**data, "user": user, "ts": ts})
         action_ru = "Запуск" if data["action"] == "запуск" else "Остановка"
         send(chat,
