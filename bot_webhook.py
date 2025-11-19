@@ -302,7 +302,7 @@ def process_step(uid, chat, text, user_repr):
                 now = datetime.now()
                 t = [now.strftime("%H:%M"), (now-timedelta(minutes=10)).strftime("%H:%M"),
                      (now-timedelta(minutes=20)).strftime("%H:%M"), (now-timedelta(minutes=30)).strftime("%H:%M")]
-                send(chat, "Время:", keyboard([t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"])); return
+                send(chat, "Время:", keyboard([[t[0], t[1], "Другое время"], [t[2], t[3], "Отмена"]])); return
             except:
                 send(chat, "Неверная дата.", CANCEL_KB); return
 
