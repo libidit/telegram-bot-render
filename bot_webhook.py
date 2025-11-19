@@ -1,4 +1,5 @@
-# updated: asynchronous processing, dedupe update_id, per-user locks
+# bot_webhook.py
+# updated: integrated full Start/Stop flow (ZNP, meters), kept original structure and features
 import os
 import json
 import logging
@@ -33,7 +34,8 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 GOOGLE_CREDS_JSON = os.environ.get('GOOGLE_CREDS_JSON')  # optional: whole JSON in env
 GOOGLE_CREDS_PATH = os.environ.get('GOOGLE_CREDS_PATH')  # optional: path to uploaded secret file
-SHEET_NAME = os.environ.get('SHEET_NAME', 'Sheet1')
+# If necessary, you can change this sheet name to whatever you actually have in Google Sheets.
+STARTSTOP_SHEET_NAME = os.environ.get('STARTSTOP_SHEET_NAME', 'Старт-Стоп')
 
 # Fallback to secret files if env not set (Render mounts uploaded secret files to /etc/secrets)
 if not TELEGRAM_TOKEN:
@@ -107,10 +109,12 @@ def init_gsheets():
 sh = init_gsheets()
 
 # ----------------------------
-# Config for StartStop sheet
+# Config for StartStop sheet (headers include ZNP and meters)
 # ----------------------------
-STARTSTOP_SHEET_NAME = 'Старт-Стоп'
-HEADERS_STARTSTOP = ['Дата', 'Время', 'Номер линии', 'Действие', 'Причина', 'Пользователь', 'Время отправки', 'Статус']
+HEADERS_STARTSTOP = [
+    'Дата', 'Время', 'Номер линии', 'Действие', 'Причина',
+    'ЗНП', 'Метров брака', 'Пользователь', 'Время отправки', 'Статус'
+]
 
 # ----------------------------
 # Worksheet helpers
@@ -123,7 +127,7 @@ def get_or_create_ws_by_name(workbook, name):
     except Exception:
         # create
         try:
-            ws = workbook.add_worksheet(title=name, rows=1000, cols=len(HEADERS_STARTSTOP))
+            ws = workbook.add_worksheet(title=name, rows=1000, cols=max(10, len(HEADERS_STARTSTOP)))
             log.info(f"Создан лист '{name}'")
             return ws
         except Exception:
@@ -193,6 +197,10 @@ def append_to_startstop_sheet_by_headers(data_dict):
                 row.append('Запуск' if action == 'запуск' else 'Остановка' if action == 'остановка' else action)
             elif h == 'Причина':
                 row.append(data_dict.get('reason', ''))
+            elif h == 'ЗНП':
+                row.append(data_dict.get('znp', ''))
+            elif h == 'Метров брака':
+                row.append(data_dict.get('meters', ''))
             elif h == 'Пользователь':
                 row.append(data_dict.get('user_repr', ''))
             elif h == 'Время отправки':
@@ -216,6 +224,7 @@ def load_reasons():
                 ws = sh.worksheet(name)
                 vals = ws.col_values(1)
                 res = [v.strip() for v in vals if v and v.strip()]
+                # если первая строка — заголовок, опускаем
                 if res and res[0].lower().startswith('прич'):
                     res = res[1:]
                 if not res:
@@ -242,6 +251,7 @@ def keyboard_from_rows(rows, one_time=False, resize=True):
     return kb
 
 def main_menu_kb():
+    # кнопки по содержимому (размер подтягивается Telegram сам)
     return keyboard_from_rows([["Старт/Стоп"], ["Брак"], ["Отменить последнюю запись"]])
 
 def cancel_kb():
@@ -258,10 +268,9 @@ def time_menu_kb():
     for mins in [0, 10, 20, 30]:
         t = (now - timedelta(minutes=mins)).strftime('%H:%M')
         times.append(t)
-    row1 = times[:2]
-    row2 = times[2:]
-    row1.append('Другое время')
-    row2.append('Отмена')
+    # arrange into two rows and 'Другое время' + 'Отмена'
+    row1 = times[:2] + ['Другое время']
+    row2 = times[2:] + ['Отмена']
     return keyboard_from_rows([row1, row2], one_time=True)
 
 def action_menu_kb():
@@ -313,6 +322,7 @@ def parse_date_input(s):
     try:
         d, m, y = map(int, s.split('.'))
         datetime(year=y, month=m, day=d)
+        # Return ISO for internal use + display same as input
         return f"{y:04d}-{m:02d}-{d:02d}", s
     except Exception:
         return None, None
@@ -324,6 +334,13 @@ def validate_time_input(s):
         if 0 <= hh < 24 and 0 <= mm < 60:
             return True
     return False
+
+def validate_znp(s):
+    return s.isdigit() and len(s) == 4
+
+def validate_meters(s):
+    # allow integer >= 0
+    return s.isdigit()
 
 # ----------------------------
 # Telegram helpers
@@ -421,6 +438,7 @@ def process_update(update):
                 send_message(chat_id, "Отменено.", reply_markup=main_menu_kb())
                 return
 
+            # ---------- FLOW STEPS ----------
             if step == "line":
                 if not text.isdigit() or not (1 <= int(text) <= 15):
                     send_message(chat_id, "Введите номер линии от 1 до 15 (целое число):", reply_markup=cancel_kb())
@@ -484,74 +502,56 @@ def process_update(update):
                     return
                 action = "запуск" if text == "Запуск" else "остановка"
                 state["data"]["action"] = action
+                # if start -> request ZNP -> meters -> save
                 if action == "запуск":
-                    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    data_dict = {
-                        "date_display": state["data"].get("date_display", ""),
-                        "time": state["data"].get("time", ""),
-                        "line": state["data"].get("line", ""),
-                        "action": action,
-                        "reason": "",
-                        "user_repr": user_repr,
-                        "timestamp": ts,
-                        "status": ""
-                    }
-                    append_to_startstop_sheet_by_headers(data_dict)
-                    msg = (
-                        "<b>Записано!</b>\n"
-                        f"<b>Дата:</b> {data_dict['date_display']}\n"
-                        f"<b>Время:</b> {data_dict['time']}\n"
-                        f"<b>Линия:</b> {data_dict['line']}\n"
-                        f"<b>Действие:</b> {'Запуск'}\n"
-                        f"<b>Причина:</b> —\n"
-                        f"<b>Пользователь:</b> {user_repr}"
-                    )
-                    cancel_flow(uid)
-                    send_message(chat_id, msg, reply_markup=main_menu_kb())
+                    state["step"] = "znp"
+                    send_message(chat_id, "Номер ЗНП (4 цифры):", reply_markup=cancel_kb())
                     return
                 else:
+                    # остановка -> сначала причина, потом ZNP и meters
                     reasons = load_reasons()
                     state["step"] = "reason"
                     send_message(chat_id, "Причина остановки:", reply_markup=reasons_menu_kb(reasons))
                     return
 
+            # ---- reason for stop ----
             if step == "reason":
                 reasons = load_reasons()
                 if text == "Другое":
                     state["step"] = "reason_custom"
                     send_message(chat_id, "Введите причину остановки (текст):", reply_markup=cancel_kb())
                     return
-                if text not in reasons:
-                    state["data"]["reason"] = text
-                else:
-                    state["data"]["reason"] = text
-                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                data_dict = {
-                    "date_display": state["data"].get("date_display", ""),
-                    "time": state["data"].get("time", ""),
-                    "line": state["data"].get("line", ""),
-                    "action": state["data"].get("action", ""),
-                    "reason": state["data"].get("reason", ""),
-                    "user_repr": user_repr,
-                    "timestamp": ts,
-                    "status": ""
-                }
-                append_to_startstop_sheet_by_headers(data_dict)
-                msg = (
-                    "<b>Записано!</b>\n"
-                    f"<b>Дата:</b> {data_dict['date_display']}\n"
-                    f"<b>Время:</b> {data_dict['time']}\n"
-                    f"<b>Линия:</b> {data_dict['line']}\n"
-                    f"<b>Действие:</b> {'Остановка'}\n"
-                    f"<b>Причина:</b> {data_dict['reason']}\n"
-                    f"<b>Пользователь:</b> {user_repr}"
-                )
-                cancel_flow(uid)
-                send_message(chat_id, msg, reply_markup=main_menu_kb())
+                # если выбрана причина из списка или введена произвольно
+                state["data"]["reason"] = text
+                # теперь запрос ЗНП
+                state["step"] = "znp"
+                send_message(chat_id, "Номер ЗНП (4 цифры):", reply_markup=cancel_kb())
                 return
 
             if step == "reason_custom":
                 state["data"]["reason"] = text
+                state["step"] = "znp"
+                send_message(chat_id, "Номер ЗНП (4 цифры):", reply_markup=cancel_kb())
+                return
+
+            # ---- znp (applies to both старт и остановка) ----
+            if step == "znp":
+                if not validate_znp(text):
+                    send_message(chat_id, "Неверный формат ЗНП. Введите ровно 4 цифры:", reply_markup=cancel_kb())
+                    return
+                state["data"]["znp"] = text
+                state["step"] = "meters"
+                send_message(chat_id, "Количество метров брака (целое число):", reply_markup=cancel_kb())
+                return
+
+            # ---- meters ----
+            if step == "meters":
+                if not validate_meters(text):
+                    send_message(chat_id, "Введите количество метров брака числом (целое):", reply_markup=cancel_kb())
+                    return
+                state["data"]["meters"] = text
+
+                # теперь формируем dict и сохраняем в таблицу
                 ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 data_dict = {
                     "date_display": state["data"].get("date_display", ""),
@@ -559,20 +559,27 @@ def process_update(update):
                     "line": state["data"].get("line", ""),
                     "action": state["data"].get("action", ""),
                     "reason": state["data"].get("reason", ""),
+                    "znp": state["data"].get("znp", ""),
+                    "meters": state["data"].get("meters", ""),
                     "user_repr": user_repr,
                     "timestamp": ts,
                     "status": ""
                 }
+
                 append_to_startstop_sheet_by_headers(data_dict)
+
                 msg = (
                     "<b>Записано!</b>\n"
                     f"<b>Дата:</b> {data_dict['date_display']}\n"
                     f"<b>Время:</b> {data_dict['time']}\n"
                     f"<b>Линия:</b> {data_dict['line']}\n"
-                    f"<b>Действие:</b> {'Остановка'}\n"
-                    f"<b>Причина:</b> {data_dict['reason']}\n"
+                    f"<b>Действие:</b> {'Запуск' if data_dict['action']=='запуск' else 'Остановка'}\n"
+                    f"<b>Причина:</b> {data_dict['reason'] or '—'}\n"
+                    f"<b>ЗНП:</b> {data_dict['znp']}\n"
+                    f"<b>Метров брака:</b> {data_dict['meters']}\n"
                     f"<b>Пользователь:</b> {user_repr}"
                 )
+
                 cancel_flow(uid)
                 send_message(chat_id, msg, reply_markup=main_menu_kb())
                 return
