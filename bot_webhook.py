@@ -175,9 +175,18 @@ def mark_as_deleted(ws, row_index):
 
 # ==================== Клавиатуры ====================
 def keyboard(rows):
-    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True}
+    return {
+        "keyboard": [[{"text": t} for t in row] for row in rows],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "input_field_placeholder": "Выберите действие"
+    }
 
-MAIN_KB = keyboard([["Старт/Стоп"], ["Брак"], ["Отменить последнюю запись"]])
+MAIN_KB = keyboard([
+    ["Старт/Стоп", "Брак"],
+    ["Отменить последнюю запись"]
+])
+
 CANCEL_KB = keyboard([["Отмена"]])
 CONFIRM_KB = keyboard([["Да, удалить", "Нет"]])
 
