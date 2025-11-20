@@ -75,14 +75,25 @@ controllers_defect = get_controllers(ws_ctrl_def)
 def get_last_records(ws, n=2):
     try:
         values = ws.get_all_values()
+        if len(values) <= 1:
+            return []
+
+        header = values[0]
+        try:
+            status_col_index = header.index("Статус")  # находим колонку "Статус" по названию
+        except ValueError:
+            status_col_index = -1  # если нет — считаем, что нет удалённых
+
         valid = []
         for row in reversed(values[1:]):
-            if len(row) >= 11 and row[10].strip() != "Удалено":
+            # Если колонка Статус существует и не "Удалено"
+            if status_col_index == -1 or len(row) <= status_col_index or row[status_col_index].strip() != "Удалено":
                 valid.append(row)
                 if len(valid) >= n:
                     break
         return list(reversed(valid))
-    except:
+    except Exception as e:
+        log.error(f"get_last_records error: {e}")
         return []
 
 # ==================== Уведомление контролёрам ====================
