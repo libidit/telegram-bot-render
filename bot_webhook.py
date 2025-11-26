@@ -1,5 +1,6 @@
 # bot_webhook.py — ФИНАЛЬНАЯ ВЕРСИЯ (декабрь 2025)
 # Всё работает: последние записи, уведомления контролёрам, отмена с подтверждением
+# Изменение: при выборе времени через кнопки к формату чч:мм добавляются текущие секунды (чч:мм:сс).
 import os
 import json
 import logging
@@ -319,7 +320,7 @@ def process(uid, chat, text, user_repr):
             msg += f"Действие: {action}\n"
             msg += f"ЗНП: <code>{znp}</code>\n"
             msg += f"Брака: {meters}м | {defect}\n\n"
-            msg += "<b>Удалить эту запись?</b> (статус → «Удалено»)"
+            msg += "<b>Удалить эту запись?</b> (статус → «Удалено")"
             send(chat, msg, CONFIRM_KB)
             states[uid] = {"step": "delete_confirm", "chat": chat, "data": {"ws": ws, "row_index": row_index}}
             return
@@ -381,7 +382,9 @@ def process(uid, chat, text, user_repr):
             st["step"] = "time_custom"; send(chat, "чч:мм:", CANCEL_KB); return
         if not (len(text) == 5 and text[2] == ":" and text[:2].isdigit() and text[3:].isdigit()):
             send(chat, "Неверное время.", CANCEL_KB); return
-        data["time"] = text
+        # Если время выбрано через кнопку (формат чч:мм), добавляем текущие секунды
+        secs = now_msk().strftime(":%S")
+        data["time"] = text + secs
         if flow == "defect":
             st["step"] = "znp_prefix"
             curr = now_msk().strftime("%m%y")
@@ -396,6 +399,7 @@ def process(uid, chat, text, user_repr):
     if step == "time_custom":
         if not (len(text) == 5 and text[2] == ":" and text[:2].isdigit() and text[3:].isdigit()):
             send(chat, "Формат чч:мм", CANCEL_KB); return
+        # Пользователь ввёл вручную — сохраняем как есть (без добавления секунд)
         data["time"] = text
         if flow == "defect":
             st["step"] = "znp_prefix"
