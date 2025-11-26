@@ -320,7 +320,7 @@ def process(uid, chat, text, user_repr):
             msg += f"Действие: {action}\n"
             msg += f"ЗНП: <code>{znp}</code>\n"
             msg += f"Брака: {meters}м | {defect}\n\n"
-            msg += "<b>Удалить эту запись?</b> (статус → «Удалено")"
+            msg += "<b>Удалить эту запись?</b> (статус → «Удалено)"
             send(chat, msg, CONFIRM_KB)
             states[uid] = {"step": "delete_confirm", "chat": chat, "data": {"ws": ws, "row_index": row_index}}
             return
