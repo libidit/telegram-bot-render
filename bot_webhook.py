@@ -16,7 +16,7 @@
 //    ├── handlers_defect.py
 //    └── handlers_delete.py
 
-//app.py
+app.py
 from flask import Flask, request
 from filelock import FileLock
 from config import TELEGRAM_TOKEN, PORT, LOCK_PATH
@@ -40,7 +40,7 @@ def webhook():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
 
-//config.py
+config.py
 import os
 import json
 import logging
@@ -55,10 +55,10 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 PORT = int(os.getenv("PORT", 5000))
 
-//bot/__init__.py
+bot/__init__.py
 # package marker
 
-//bot/utils.py
+bot/utils.py
 from datetime import datetime, timezone
 from config import MSK_OFFSET
 
@@ -66,7 +66,7 @@ def now_msk():
     # return timezone-aware datetime in MSK
     return datetime.now(timezone(MSK_OFFSET))
 
-//bot/telegram.py
+bot/telegram.py
 import json
 import requests
 from config import TELEGRAM_TOKEN, log
@@ -81,7 +81,7 @@ def send_message(chat_id, text, markup=None):
     except Exception as e:
         log.exception(f"send_message error: {e}")
 
-//bot/sheets.py
+bot/sheets.py
 import time
 import gspread
 from config import CREDS, SPREADSHEET_ID, log
@@ -251,7 +251,7 @@ def mark_as_deleted(ws, row_index):
     except Exception as e:
         log.error(f"mark_as_deleted error: {e}")
 
-//bot/notify.py
+bot/notify.py
 import requests
 from config import TELEGRAM_TOKEN, log
 
@@ -266,7 +266,7 @@ def notify_controllers_cached(ids, message):
         except Exception as e:
             log.warning(f"notify_controllers error: {e}")
 
-//bot/keyboards.py
+bot/keyboards.py
 import time
 from bot.sheets import sh, REASONS_SHEET, DEFECT_TYPES_SHEET
 
@@ -314,7 +314,7 @@ def get_defect_kb():
         DEFECTS_CACHE["until"] = now + 300
     return DEFECTS_CACHE["kb"]
 
-//bot/users.py
+bot/users.py
 from bot.sheets import ws_users
 from bot.utils import now_msk
 
@@ -342,7 +342,7 @@ def request_access(uid, username):
     except Exception:
         return False
 
-//bot/states.py
+bot/states.py
 import time
 import threading
 from bot.keyboards import MAIN_KB
@@ -367,7 +367,7 @@ def timeout_worker():
 
 threading.Thread(target=timeout_worker, daemon=True).start()
 
-//bot/dispatcher.py
+bot/dispatcher.py
 from bot.telegram import send_message
 from bot.keyboards import MAIN_KB
 from bot.users import is_allowed, has_request, request_access
@@ -433,7 +433,7 @@ def dispatch_update(upd):
         send_message(chat, "Неизвестный поток. Начните заново.", MAIN_KB)
         states.pop(uid, None)
 
-//bot/handlers_delete.py
+bot/handlers_delete.py
 from bot.sheets import find_last_entry, mark_as_deleted
 from bot.telegram import send_message
 from bot.keyboards import CONFIRM_KB, MAIN_KB
@@ -501,7 +501,7 @@ def handle_message(uid, chat, text=None):
         send_message(chat, msg, CONFIRM_KB)
         ST[uid] = {"step": "delete_confirm", "chat": chat, "data": {"ws": ws, "row_index": row_index}}
 
-//bot/handlers_startstop.py
+bot/handlers_startstop.py
 from bot.states import states
 from bot.telegram import send_message
 from bot.keyboards import CANCEL_KB, keyboard, get_reasons_kb
@@ -725,7 +725,7 @@ def handle_message(uid, chat, text):
         states.pop(uid, None)
         return
 
-//bot/handlers_defect.py
+bot/handlers_defect.py
 from bot.states import states
 from bot.telegram import send_message
 from bot.keyboards import CANCEL_KB, keyboard, get_defect_kb
