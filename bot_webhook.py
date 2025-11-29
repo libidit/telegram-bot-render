@@ -197,29 +197,41 @@ def find_last_entry(uid):
 # ==================== Пометить как "Удалено" + уведомление ====================
 def mark_as_deleted(ws, row_index):
     try:
-        ws.update_cell(row_index, 11, "Удалено")
+        # Сначала читаем заголовки, чтобы найти колонку "Статус"
+        header = ws.row_values(1)
+        try:
+            status_col = header.index("Статус") + 1  # +1 потому что gspread нумерует с 1
+        except ValueError:
+            log.error(f"В листе {ws.title} нет колонки 'Статус'")
+            status_col = len(header) + 1  # если нет — пишем в конец
+
+        # Записываем "Удалено" в правильную колонку
+        ws.update_cell(row_index, status_col, "Удалено")
+
+        # Теперь читаем строку для уведомления
         row = ws.row_values(row_index)
-        if len(row) >= 11:
-            sheet = ws.title
-            if sheet == DEFECT_SHEET:
-                msg = (f"ЗАПИСЬ БРАКА УДАЛЕНА\n"
-                       f"Линия: {row[2]}\n"
-                       f"{row[0]} {row[1]}\n"
-                       f"ЗНП: <code>{row[4]}</code>\n"
-                       f"Метров: {row[5]}")
-                notify_controllers(get_controllers_cached(ws_ctrl_def), msg)
-                
-            else:
-                action = "Запуск" if row[3] == "запуск" else "Остановка"
-                msg = (f"ЗАПИСЬ СТАРТ/СТОП УДАЛЕНА\n"
-                       f"Линия: {row[2]}\n"
-                       f"{row[0]} {row[1]}\n"
-                       f"Действие: {action}\n"
-                       f"Причина: {row[4] if len(row)>4 else '—'}")
-                notify_controllers(get_controllers_cached(ws_ctrl_ss), msg)
+        sheet = ws.title
+
+        if sheet == DEFECT_SHEET:
+            msg = (f"ЗАПИСЬ БРАКА УДАЛЕНА\n"
+                   f"Линия: {row[2] if len(row)>2 else '?'}\n"
+                   f"{row[0] if len(row)>0 else '?'} {row[1] if len(row)>1 else '?'}\n"
+                   f"ЗНП: <code>{row[4] if len(row)>4 else '—'}</code>\n"
+                   f"Метров: {row[5] if len(row)>5 else '?'}")
+            notify_controllers(get_controllers_cached(ws_ctrl_def), msg)
+        else:
+            action = "Запуск" if len(row)>3 and row[3] == "запуск" else "Остановка"
+            reason = row[4] if len(row)>4 else "—"
+            msg = (f"ЗАПИСЬ СТАРТ/СТОП УДАЛЕНА\n"
+                   f"Линия: {row[2] if len(row)>2 else '?'}\n"
+                   f"{row[0] if len(row)>0 else '?'} {row[1] if len(row)>1 else '?'}\n"
+                   f"Действие: {action}\n"
+                   f"Причина: {reason}")
+            notify_controllers(get_controllers_cached(ws_ctrl_ss), msg)
+
     except Exception as e:
         log.error(f"mark_as_deleted error: {e}")
-
+        
 # ==================== Клавиатуры ====================
 def keyboard(rows):
     return {
