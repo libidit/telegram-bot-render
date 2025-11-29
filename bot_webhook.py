@@ -1,6 +1,6 @@
-# bot_webhook.py — ФИНАЛЬНАЯ ВЕРСИЯ (декабрь 2025)
+# bot_webhook.py — ФИНАЛЬНАЯ ВЕРСИЯ (декабрь 2025) — ПЕРЕРАБОТАНО: локальные меню для потоков
 # Всё работает: последние записи, уведомления контролёрам, отмена с подтверждением
-# Изменение: при выборе времени через кнопки к формату чч:мм добавляются текущие секунды (чч:мм:сс).
+# Изменение: кнопка "Отменить последнюю запись" перемещена в меню каждого потока
 import os
 import json
 import logging
@@ -81,13 +81,12 @@ def get_last_records(ws, n=2):
 
         header = values[0]
         try:
-            status_col_index = header.index("Статус")  # находим колонку "Статус" по названию
+            status_col_index = header.index("Статус")
         except ValueError:
-            status_col_index = -1  # если нет — считаем, что нет удалённых
+            status_col_index = -1
 
         valid = []
         for row in reversed(values[1:]):
-            # Если колонка Статус существует и не "Удалено"
             if status_col_index == -1 or len(row) <= status_col_index or row[status_col_index].strip() != "Удалено":
                 valid.append(row)
                 if len(valid) >= n:
@@ -145,7 +144,20 @@ def append_row(data):
                f"Причина: {data.get('reason','—')}")
         notify_controllers(controllers_startstop, msg)
 
-# ==================== Поиск последней записи пользователя ====================
+# ==================== Поиск последней записи пользователя в конкретном листе ====================
+def find_last_entry_in_sheet(uid, ws):
+    user_col = 9
+    try:
+        values = ws.get_all_values()
+        for i in range(len(values)-1, 0, -1):
+            row = values[i]
+            if len(row) >= user_col and str(uid) in row[user_col-1]:
+                return True, row, i + 1
+    except Exception as e:
+        log.error(f"find_last_entry_in_sheet error: {e}")
+    return False, None, None
+
+# Старая универсальная функция оставлена для совместимости (не используется для отмены)
 def find_last_entry(uid):
     user_col = 9
     ts_col = 10
@@ -194,13 +206,17 @@ def keyboard(rows):
         "input_field_placeholder": "Выберите действие"
     }
 
+# Главное меню: убрали "Отменить последнюю запись"
 MAIN_KB = keyboard([
     ["Старт/Стоп", "Брак"],
-    ["Отменить последнюю запись"]
 ])
 
 CANCEL_KB = keyboard([["Отмена"]])
 CONFIRM_KB = keyboard([["Да, удалить", "Нет"]])
+
+# Локальное меню потока (вариант B: развёрнуто)
+def flow_menu_kb():
+    return keyboard([["Начать новую запись", "Отменить последнюю запись"], ["Назад"]])
 
 REASONS_CACHE = {"kb": None, "until": 0}
 DEFECTS_CACHE = {"kb": None, "until": 0}
@@ -261,7 +277,7 @@ threading.Thread(target=timeout_worker, daemon=True).start()
 def process(uid, chat, text, user_repr):
     last_activity[uid] = time.time()
 
-    # === Подтверждение удаления ===
+    # === Глобальная отмена подтверждения удаления ===
     if uid in states and states[uid].get("step") == "delete_confirm":
         if text == "Да, удалить":
             ws = states[uid]["data"]["ws"]
@@ -273,9 +289,15 @@ def process(uid, chat, text, user_repr):
         states.pop(uid, None)
         return
 
-    # === Главное меню + последние записи ===
+    # === Если нет состояния — показываем главное меню или входим в поток ===
     if uid not in states:
-        if text in ("/start", "Старт/Стоп"):
+        # /start показывает главное меню
+        if text == "/start":
+            send(chat, "Выберите действие:", MAIN_KB)
+            return
+
+        # Входим в поток Старт/Стоп (локальное меню)
+        if text == "Старт/Стоп":
             records = get_last_records(ws_startstop, 2)
             msg = "<b>Последние записи Старт/Стоп:</b>\n\n"
             if not records:
@@ -286,10 +308,12 @@ def process(uid, chat, text, user_repr):
                     reason = r[4] if len(r) > 4 else "—"
                     msg += f"• {r[0]} {r[1]} | Линия {r[2]} | {action} | {reason}\n"
             send(chat, msg)
-            states[uid] = {"step": "line", "data": {}, "chat": chat, "flow": "startstop"}
-            send(chat, "Введите номер линии (1–15):", CANCEL_KB)
+            # Создаём локальное состояние потока
+            states[uid] = {"step": "flow_menu", "data": {}, "chat": chat, "flow": "startstop"}
+            send(chat, "Выберите действие в потоке Старт/Стоп:", flow_menu_kb())
             return
 
+        # Входим в поток Брак (локальное меню)
         if text == "Брак":
             records = get_last_records(ws_defect, 2)
             msg = "<b>Последние записи Брака:</b>\n\n"
@@ -302,32 +326,15 @@ def process(uid, chat, text, user_repr):
                     defect = r[6] if len(r) > 6 else "—"
                     msg += f"• {r[0]} {r[1]} | Линия {r[2]} | <code>{znp}</code> | {meters}м | {defect}\n"
             send(chat, msg)
-            states[uid] = {"step": "line", "data": {"action": "брак"}, "chat": chat, "flow": "defect"}
-            send(chat, "Введите номер линии (1–15):", CANCEL_KB)
+            states[uid] = {"step": "flow_menu", "data": {"action": "брак"}, "chat": chat, "flow": "defect"}
+            send(chat, "Выберите действие в потоке Брак:", flow_menu_kb())
             return
 
-        if text == "Отменить последнюю запись":
-            success, sheet_name, row, ws, row_index = find_last_entry(uid)
-            if not success:
-                send(chat, "У вас нет записей для отмены.", MAIN_KB)
-                return
-            action = row[3] if len(row) > 3 else "брак"
-            znp = row[4] if len(row) > 4 else "—"
-            meters = row[5] if len(row) > 5 else "—"
-            defect = row[6] if len(row) > 6 else "—"
-            msg = f"<b>Последняя запись ({sheet_name}):</b>\n"
-            msg += f"{row[0]} {row[1]} • Линия {row[2]}\n"
-            msg += f"Действие: {action}\n"
-            msg += f"ЗНП: <code>{znp}</code>\n"
-            msg += f"Брака: {meters}м | {defect}\n\n"
-            msg += "<b>Удалить эту запись?</b> (статус → «Удалено)"
-            send(chat, msg, CONFIRM_KB)
-            states[uid] = {"step": "delete_confirm", "chat": chat, "data": {"ws": ws, "row_index": row_index}}
-            return
-
+        # Если текст неизвестен — показываем главное меню
         send(chat, "Выберите действие:", MAIN_KB)
         return
 
+    # === Общая отмена текущего диалога ===
     if text == "Отмена":
         states.pop(uid, None)
         send(chat, "Отменено.", MAIN_KB)
@@ -338,7 +345,50 @@ def process(uid, chat, text, user_repr):
     data = st["data"]
     flow = st.get("flow", "startstop")
 
-    # ==================== Все шаги (линия → дата → время → ...) ====================
+    # ==================== Обработка локального меню потока ====================
+    if step == "flow_menu":
+        if text == "Назад":
+            states.pop(uid, None)
+            send(chat, "Возврат в главное меню.", MAIN_KB)
+            return
+
+        if text == "Начать новую запись":
+            # переводим в шага ввода строки (как раньше)
+            st["step"] = "line"
+            st["data"] = data if data else {}
+            st["chat"] = chat
+            send(chat, "Введите номер линии (1–15):", CANCEL_KB)
+            return
+
+        if text == "Отменить последнюю запись":
+            # Ищем последнюю запись в соответствующем листе
+            ws = ws_defect if flow == "defect" else ws_startstop
+            success, row, row_index = find_last_entry_in_sheet(uid, ws)
+            if not success:
+                send(chat, "У вас нет записей для отмены в этом листе.", flow_menu_kb())
+                return
+            action = row[3] if len(row) > 3 else "брак"
+            znp = row[4] if len(row) > 4 else "—"
+            meters = row[5] if len(row) > 5 else "—"
+            defect = row[6] if len(row) > 6 else "—"
+            sheet_name = ws.title
+            msg = f"<b>Последняя запись ({sheet_name}):</b>\n"
+            msg += f"{row[0]} {row[1]} • Линия {row[2]}\n"
+            msg += f"Действие: {action}\n"
+            msg += f"ЗНП: <code>{znp}</code>\n"
+            msg += f"Брака: {meters}м | {defect}\n\n"
+            msg += "<b>Удалить эту запись?</b> (статус → «Удалено)")
+            send(chat, msg, CONFIRM_KB)
+            # Сохраняем контекст для подтверждения
+            st["step"] = "delete_confirm"
+            st["data"] = {"ws": ws, "row_index": row_index}
+            return
+
+        # Неизвестная команда в локальном меню
+        send(chat, "Выберите одно из действий:", flow_menu_kb())
+        return
+
+    # ==================== Все шаги записи (линия → дата → время → ...) ====================
     if step == "line":
         if not (text.isdigit() and 1 <= int(text) <= 15):
             send(chat, "Номер линии 1–15:", CANCEL_KB); return
