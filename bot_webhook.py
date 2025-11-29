@@ -148,8 +148,8 @@ def append_row(data):
                f"{data['date']} {data['time']}\n"
                f"Действие: {action_ru}\n"
                f"Причина: {data.get('reason','—')}")
-        notify_controllers(controllers_startstop, msg)
-
+        notify_controllers(get_controllers_cached(ws_ctrl_ss), msg)
+        
 # ==================== Поиск последней записи пользователя ====================
 def find_last_entry(uid):
     candidates = []
@@ -207,7 +207,8 @@ def mark_as_deleted(ws, row_index):
                        f"{row[0]} {row[1]}\n"
                        f"ЗНП: <code>{row[4]}</code>\n"
                        f"Метров: {row[5]}")
-                notify_controllers(controllers_defect, msg)
+                notify_controllers(get_controllers_cached(ws_ctrl_def), msg)
+                
             else:
                 action = "Запуск" if row[3] == "запуск" else "Остановка"
                 msg = (f"ЗАПИСЬ СТАРТ/СТОП УДАЛЕНА\n"
@@ -215,7 +216,7 @@ def mark_as_deleted(ws, row_index):
                        f"{row[0]} {row[1]}\n"
                        f"Действие: {action}\n"
                        f"Причина: {row[4] if len(row)>4 else '—'}")
-                notify_controllers(controllers_startstop, msg)
+                notify_controllers(get_controllers_cached(ws_ctrl_ss), msg)
     except Exception as e:
         log.error(f"mark_as_deleted error: {e}")
 
