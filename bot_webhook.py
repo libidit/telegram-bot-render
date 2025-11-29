@@ -1,17 +1,17 @@
-# bot_webhook.py — ФИНАЛЬНАЯ ВЕРСИЯ (декабрь 2025)
-# Всё работает: последние записи, уведомления контролёрам, отмена с подтверждением
-# Изменение: при выборе времени через кнопки к формату чч:мм добавляются текущие секунды (чч:мм:сс).
+# bot_webhook.py — ФИНАЛЬНАЯ ВЕРСИЯ с АВТОРИЗАЦИЕЙ (декабрь 2025)
 import os
 import json
 import logging
 import requests
 import threading
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request
 import gspread
 from google.oauth2 import service_account
 from filelock import FileLock
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -42,6 +42,7 @@ STARTSTOP_SHEET = "Старт-Стоп"
 DEFECT_SHEET = "Брак"
 CTRL_STARTSTOP_SHEET = "Контр_Старт-Стоп"
 CTRL_DEFECT_SHEET = "Контр_Брак"
+ACCESS_SHEET = "Доступ"                     # ← НОВЫЙ ЛИСТ
 
 HEADERS_STARTSTOP = ["Дата","Время","Номер линии","Действие","Причина","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
 HEADERS_DEFECT    = ["Дата","Время","Номер линии","Действие","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
@@ -61,7 +62,43 @@ ws_defect    = get_ws(DEFECT_SHEET, HEADERS_DEFECT)
 ws_ctrl_ss   = get_ws(CTRL_STARTSTOP_SHEET)
 ws_ctrl_def  = get_ws(CTRL_DEFECT_SHEET)
 
-# ==================== Контролёры (кешируем) ====================
+# Лист доступа
+try:
+    ws_access = sh.worksheet(ACCESS_SHEET)
+except gspread.exceptions.WorksheetNotFound:
+    ws_access = sh.add_worksheet(title=ACCESS_SHEET, rows=1000, cols=5)
+    ws_access.append_row(["ID", "ФИО", "Роль", "Добавлен", "Username"])
+
+# ==================== Авторизация ====================
+ALLOWED_USERS = set()
+masters = set()           # ID мастеров
+PENDING_USERS = {}        # uid → None (ждёт ФИО) или dict с данными
+
+def load_access():
+    global ALLOWED_USERS, masters
+    ALLOWED_USERS.clear()
+    masters.clear()
+    try:
+        rows = ws_access.get_all_values()
+        for row in rows[1:]:
+            if len(row) >= 3 and row[0].isdigit():
+                uid = int(row[0])
+                ALLOWED_USERS.add(uid)
+                if row[2].lower() == "мастер":
+                    masters.add(uid)
+    except Exception as e:
+        log.error(f"load_access error: {e}")
+
+load_access()
+
+# Обновление кэша каждые 5 минут
+def auto_refresh_access():
+    while True:
+        time.sleep(300)
+        load_access()
+threading.Thread(target=auto_refresh_access, daemon=True).start()
+
+# ==================== Контролёры ====================
 def get_controllers(sheet):
     try:
         ids = sheet.col_values(1)[1:]
@@ -185,20 +222,11 @@ def mark_as_deleted(ws, row_index):
     except Exception as e:
         log.error(f"mark_as_deleted error: {e}")
 
-# ==================== Клавиатуры ====================
+# ==================== Клавиатуры и отправка ====================
 def keyboard(rows):
-    return {
-        "keyboard": [[{"text": t} for t in row] for row in rows],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-        "input_field_placeholder": "Выберите действие"
-    }
+    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True, "one_time_keyboard": False}
 
-MAIN_KB = keyboard([
-    ["Старт/Стоп", "Брак"],
-    ["Отменить последнюю запись"]
-])
-
+MAIN_KB = keyboard([["Старт/Стоп", "Брак"], ["Отменить последнюю запись"]])
 CANCEL_KB = keyboard([["Отмена"]])
 CONFIRM_KB = keyboard([["Да, удалить", "Нет"]])
 
@@ -230,6 +258,15 @@ def get_defect_kb():
         DEFECTS_CACHE["until"] = now + 300
     return DEFECTS_CACHE["kb"]
 
+def send(chat_id, text, markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if markup:
+        payload["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        log.exception(f"send error: {e}")
+
 # ==================== Отправка сообщений ====================
 def send(chat_id, text, markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -257,11 +294,49 @@ def timeout_worker():
 
 threading.Thread(target=timeout_worker, daemon=True).start()
 
-# ==================== Основная логика ====================
-def process(uid, chat, text, user_repr):
+# ==================== Основная логика (с авторизацией) ====================
+def process(uid, chat, text, user_repr, message):
+    global ALLOWED_USERS
     last_activity[uid] = time.time()
 
-    # === Подтверждение удаления ===
+    # === МАСТЕРА И РАЗРЕШЁННЫЕ ===
+    if uid in masters or uid in ALLOWED_USERS:
+        pass  # продолжаем ниже
+    # === НОВЫЙ ПОЛЬЗОВАТЕЛЬ ===
+    elif uid not in PENDING_USERS:
+        PENDING_USERS[uid] = None
+        send(chat, "Для доступа к боту введите свою фамилию и инициалы точно как в табеле:\n\nПример: <b>Иванов И.И.</b>",
+             {"remove_keyboard": True})
+        return
+
+    # === ОЖИДАНИЕ ФИО ===
+    if PENDING_USERS.get(uid) is None:
+        fio = text.strip()
+        if not re.match(r"^[А-ЯЁA-Z]+\s[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.$", fio, re.IGNORECASE):
+            send(chat, "Неверный формат.\n\nПример: <b>Петров А.В.</b>")
+            return
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Добавить", callback_data=f"approve_{uid}"),
+            InlineKeyboardButton("Отклонить", callback_data=f"reject_{uid}")
+        ]])
+
+        username = message["from"].get("username", "")
+        first_name = message["from"].get("first_name", "")
+        msg = (f"Запрос на доступ\n\n"
+               f"ФИО: <b>{fio.title()}</b>\n"
+               f"Имя: {first_name}\n"
+               f"Username: {username and '@'+username or '—'}\n"
+               f"ID: <code>{uid}</code>")
+
+        for master_id in list(masters) or [123456789]:  # запасной ID, если мастеров ещё нет
+            send(master_id, msg, kb)
+
+        PENDING_USERS[uid] = {"fio": fio.title(), "username": username, "first_name": first_name}
+        send(chat, "Заявка отправлена мастеру.\nОжидайте подтверждения.")
+        return
+
+# === Подтверждение удаления ===
     if uid in states and states[uid].get("step") == "delete_confirm":
         if text == "Да, удалить":
             ws = states[uid]["data"]["ws"]
@@ -526,7 +601,40 @@ def health(): return {"ok": True}
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     upd = request.get_json(silent=True)
-    if not upd or "message" not in upd: return {"ok": True}
+    if not upd: return {"ok": True}
+
+    # === CALLBACK QUERY (подтверждение мастером) ===
+    if "callback_query" in upd:
+        cq = upd["callback_query"]
+        uid = cq["from"]["id"]
+        data = cq["data"]
+
+        if uid not in masters:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                          json={"callback_query_id": cq["id"], "text": "Нет прав"})
+            return {"ok": True}
+
+        if data.startswith("approve_"):
+            target_uid = int(data.split("_")[1])
+            info = PENDING_USERS.pop(target_uid, None)
+            if info:
+                ALLOWED_USERS.add(target_uid)
+                ws_access.append_row([target_uid, info["fio"], "оператор",
+                                    now_msk().strftime("%d.%m.%Y %H:%M"), info["username"] or "—"])
+                send(target_uid, "Доступ разрешён!\nТеперь вы можете пользоваться ботом.", MAIN_KB)
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                          json={"callback_query_id": cq["id"], "text": "Добавлен"})
+
+        elif data.startswith("reject_"):
+            target_uid = int(data.split("_")[1])
+            PENDING_USERS.pop(target_uid, None)
+            send(target_uid, "В доступе отказано.")
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                          json={"callback_query_id": cq["id"], "text": "Отклонено"})
+        return {"ok": True}
+
+    # === ОБЫЧНЫЕ СООБЩЕНИЯ ===
+    if "message" not in upd: return {"ok": True}
     m = upd["message"]
     chat = m["chat"]["id"]
     uid = m["from"]["id"]
@@ -534,7 +642,7 @@ def webhook():
     user_repr = f"{uid} (@{m['from'].get('username','') or 'no_user'})"
 
     with FileLock(LOCK_PATH):
-        process(uid, chat, text, user_repr)
+        process(uid, chat, text, user_repr, m)
     return {"ok": True}
 
 if __name__ == "__main__":
