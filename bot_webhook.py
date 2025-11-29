@@ -72,7 +72,7 @@ def get_controllers_cached(sheet):
         try:
             ids = sheet.col_values(1)[1:]
             cache["ids"] = [int(i.strip()) for i in ids if i.strip().isdigit()]
-            cache["until"] = now + 600  # 10 минут
+            cache["until"] = now + 86400  # 24 часа
         except:
             pass  # оставляем старый кэш, если ошибка
     return cache["ids"]
@@ -152,18 +152,47 @@ def append_row(data):
 
 # ==================== Поиск последней записи пользователя ====================
 def find_last_entry(uid):
-    user_col = 9
-    ts_col = 10
-    for ws, name in [(ws_startstop, "Старт-Стоп"), (ws_defect, "Брак")]:
+    candidates = []
+
+    for ws, sheet_name in [(ws_startstop, STARTSTOP_SHEET), (ws_defect, DEFECT_SHEET)]:
         try:
             values = ws.get_all_values()
-            for i in range(len(values)-1, 0, -1):
-                row = values[i]
+            if len(values) < 2:
+                continue
+
+            header = values[0]
+            try:
+                user_col = header.index("Пользователь") + 1      # +1 потому что gspread нумерует с 1
+                ts_col   = header.index("Время отправки") + 1
+                status_col = header.index("Статус") + 1 if "Статус" in header else None
+            except ValueError as e:
+                log.error(f"Не найдена колонка в {sheet_name}: {e}")
+                continue
+
+            # Пропускаем строки со статусом "Удалено"
+            for row_idx in range(len(values)-1, 0, -1):  # с конца к началу
+                row = values[row_idx]
+                if status_col and len(row) >= status_col and row[status_col-1].strip() == "Удалено":
+                    continue
+
                 if len(row) >= user_col and str(uid) in row[user_col-1]:
-                    return True, name, row, ws, i + 1
+                    if len(row) >= ts_col and row[ts_col-1]:
+                        try:
+                            ts = datetime.strptime(row[ts_col-1], "%Y-%m-%d %H:%M:%S")
+                            candidates.append((ts, sheet_name, row, ws, row_idx + 1))
+                            break  # нам нужна только самая свежая запись с этого листа
+                        except:
+                            continue
         except Exception as e:
-            log.error(f"find_last_entry error: {e}")
-    return False, None, None, None, None
+            log.error(f"find_last_entry error {sheet_name}: {e}")
+
+    if not candidates:
+        return False, None, None, None, None
+
+    # Выбираем самую новую по времени отправки
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, sheet_name, row, ws, row_index = candidates[0]
+    return True, sheet_name, row, ws, row_index
 
 # ==================== Пометить как "Удалено" + уведомление ====================
 def mark_as_deleted(ws, row_index):
@@ -225,14 +254,14 @@ def get_reasons_kb():
     now = time.time()
     if now > REASONS_CACHE["until"]:
         REASONS_CACHE["kb"] = build_kb("Причина остановки", ["Другое"])
-        REASONS_CACHE["until"] = now + 1440
+        REASONS_CACHE["until"] = now + 86400
     return REASONS_CACHE["kb"]
 
 def get_defect_kb():
     now = time.time()
     if now > DEFECTS_CACHE["until"]:
         DEFECTS_CACHE["kb"] = build_kb("Вид брака", ["Другое", "Без брака"])
-        DEFECTS_CACHE["until"] = now + 1440
+        DEFECTS_CACHE["until"] = now + 86400
     return DEFECTS_CACHE["kb"]
 
 # ==================== Отправка сообщений ====================
