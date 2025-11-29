@@ -1,6 +1,5 @@
-# bot_webhook.py — ФИНАЛЬНАЯ ВЕРСИЯ (декабрь 2025)
-# Всё работает: последние записи, уведомления контролёрам, отмена с подтверждением
-# Изменение: при выборе времени через кнопки к формату чч:мм добавляются текущие секунды (чч:мм:сс).
+# bot_webhook.py — НОВАЯ ЛОГИКА (декабрь 2025)
+# Отмена записи — только в своём потоке!
 import os
 import json
 import logging
@@ -44,7 +43,7 @@ CTRL_STARTSTOP_SHEET = "Контр_Старт-Стоп"
 CTRL_DEFECT_SHEET = "Контр_Брак"
 
 HEADERS_STARTSTOP = ["Дата","Время","Номер линии","Действие","Причина","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
-HEADERS_DEFECT    = ["Дата","Время","Номер линии","Действие","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
+HEADERS_DEFECT = ["Дата","Время","Номер линии","Действие","ЗНП","Метров брака","Вид брака","Пользователь","Время отправки","Статус"]
 
 def get_ws(sheet_name, headers=None):
     try:
@@ -57,11 +56,11 @@ def get_ws(sheet_name, headers=None):
     return ws
 
 ws_startstop = get_ws(STARTSTOP_SHEET, HEADERS_STARTSTOP)
-ws_defect    = get_ws(DEFECT_SHEET, HEADERS_DEFECT)
-ws_ctrl_ss   = get_ws(CTRL_STARTSTOP_SHEET)
-ws_ctrl_def  = get_ws(CTRL_DEFECT_SHEET)
+ws_defect = get_ws(DEFECT_SHEET, HEADERS_DEFECT)
+ws_ctrl_ss = get_ws(CTRL_STARTSTOP_SHEET)
+ws_ctrl_def = get_ws(CTRL_DEFECT_SHEET)
 
-# ==================== Контролёры (кешируем) ====================
+# ==================== Кэширование контролёров ====================
 CONTROLLERS_SS_CACHE = {"ids": [], "until": 0}
 CONTROLLERS_DEF_CACHE = {"ids": [], "until": 0}
 
@@ -74,35 +73,29 @@ def get_controllers_cached(sheet):
             cache["ids"] = [int(i.strip()) for i in ids if i.strip().isdigit()]
             cache["until"] = now + 86400  # 24 часа
         except:
-            pass  # оставляем старый кэш, если ошибка
+            pass
     return cache["ids"]
 
 # ==================== Последние записи (без "Удалено") ====================
 def get_last_records(ws, n=2):
     try:
         values = ws.get_all_values()
-        if len(values) <= 1:
-            return []
-
+        if len(values) <= 1: return []
         header = values[0]
-        try:
-            status_col_index = header.index("Статус")  # находим колонку "Статус" по названию
-        except ValueError:
-            status_col_index = -1  # если нет — считаем, что нет удалённых
-
+        status_col = header.index("Статус") + 1 if "Статус" in header else None
         valid = []
         for row in reversed(values[1:]):
-            # Если колонка Статус существует и не "Удалено"
-            if status_col_index == -1 or len(row) <= status_col_index or row[status_col_index].strip() != "Удалено":
-                valid.append(row)
-                if len(valid) >= n:
-                    break
+            if status_col and len(row) >= status_col and row[status_col-1].strip() == "Удалено":
+                continue
+            valid.append(row)
+            if len(valid) >= n:
+                break
         return list(reversed(valid))
     except Exception as e:
         log.error(f"get_last_records error: {e}")
         return []
 
-# ==================== Уведомление контролёрам ====================
+# ==================== Уведомления ====================
 def notify_controllers(ids, message):
     for cid in ids:
         try:
@@ -116,24 +109,14 @@ def notify_controllers(ids, message):
 
 # ==================== Запись + уведомление ====================
 def append_row(data):
-    flow = data.get("flow", "startstop")
+    flow = data.get("flow")
     ws = ws_defect if flow == "defect" else ws_startstop
     ts = now_msk().strftime("%Y-%m-%d %H:%M:%S")
     user = data["user"]
 
     if flow == "defect":
         row = [data["date"], data["time"], data["line"], "брак",
-               data.get("znp", ""), data["meters"],
-               data.get("defect_type", ""), user, ts, ""]
-    else:
-        row = [data["date"], data["time"], data["line"], data["action"],
-               data.get("reason", ""), data.get("znp", ""), data["meters"],
-               data.get("defect_type", ""), user, ts, ""]
-
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-    # Уведомления
-    if flow == "defect":
+               data.get("znp", ""), data["meters"], data.get("defect_type", ""), user, ts, ""]
         msg = (f"НОВАЯ ЗАПИСЬ БРАКА\n"
                f"Линия: {data['line']}\n"
                f"{data['date']} {data['time']}\n"
@@ -142,6 +125,9 @@ def append_row(data):
                f"Вид брака: {data.get('defect_type','—')}")
         notify_controllers(get_controllers_cached(ws_ctrl_def), msg)
     else:
+        row = [data["date"], data["time"], data["line"], data["action"],
+               data.get("reason", ""), data.get("znp", ""), data["meters"],
+               data.get("defect_type", ""), user, ts, ""]
         action_ru = "Запуск" if data["action"] == "запуск" else "Остановка"
         msg = (f"НОВАЯ ЗАПИСЬ СТАРТ/СТОП\n"
                f"Линия: {data['line']}\n"
@@ -149,106 +135,69 @@ def append_row(data):
                f"Действие: {action_ru}\n"
                f"Причина: {data.get('reason','—')}")
         notify_controllers(get_controllers_cached(ws_ctrl_ss), msg)
-        
-# ==================== Поиск последней записи пользователя ====================
-def find_last_entry(uid):
-    candidates = []
 
-    for ws, sheet_name in [(ws_startstop, STARTSTOP_SHEET), (ws_defect, DEFECT_SHEET)]:
-        try:
-            values = ws.get_all_values()
-            if len(values) < 2:
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+# ==================== Поиск последней записи в конкретном листе ====================
+def find_last_user_entry_in_sheet(uid, ws):
+    try:
+        values = ws.get_all_values()
+        if len(values) < 2: return None, None
+        header = values[0]
+        user_col = header.index("Пользователь") + 1
+        ts_col = header.index("Время отправки") + 1 if "Время отправки" in header else None
+        status_col = header.index("Статус") + 1 if "Статус" in header else None
+
+        for row_idx in range(len(values)-1, 0, -1):
+            row = values[row_idx]
+            if status_col and len(row) >= status_col and row[status_col-1].strip() == "Удалено":
                 continue
+            if len(row) >= user_col and str(uid) in str(row[user_col-1]):
+                return row, row_idx + 1
+    except Exception as e:
+        log.error(f"find_last_user_entry error: {e}")
+    return None, None
 
-            header = values[0]
-            try:
-                user_col = header.index("Пользователь") + 1      # +1 потому что gspread нумерует с 1
-                ts_col   = header.index("Время отправки") + 1
-                status_col = header.index("Статус") + 1 if "Статус" in header else None
-            except ValueError as e:
-                log.error(f"Не найдена колонка в {sheet_name}: {e}")
-                continue
-
-            # Пропускаем строки со статусом "Удалено"
-            for row_idx in range(len(values)-1, 0, -1):  # с конца к началу
-                row = values[row_idx]
-                if status_col and len(row) >= status_col and row[status_col-1].strip() == "Удалено":
-                    continue
-
-                if len(row) >= user_col and str(uid) in row[user_col-1]:
-                    if len(row) >= ts_col and row[ts_col-1]:
-                        try:
-                            ts = datetime.strptime(row[ts_col-1], "%Y-%m-%d %H:%M:%S")
-                            candidates.append((ts, sheet_name, row, ws, row_idx + 1))
-                            break  # нам нужна только самая свежая запись с этого листа
-                        except:
-                            continue
-        except Exception as e:
-            log.error(f"find_last_entry error {sheet_name}: {e}")
-
-    if not candidates:
-        return False, None, None, None, None
-
-    # Выбираем самую новую по времени отправки
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, sheet_name, row, ws, row_index = candidates[0]
-    return True, sheet_name, row, ws, row_index
-
-# ==================== Пометить как "Удалено" + уведомление ====================
+# ==================== Удаление с подтверждением ====================
 def mark_as_deleted(ws, row_index):
     try:
-        # Сначала читаем заголовки, чтобы найти колонку "Статус"
         header = ws.row_values(1)
-        try:
-            status_col = header.index("Статус") + 1  # +1 потому что gspread нумерует с 1
-        except ValueError:
-            log.error(f"В листе {ws.title} нет колонки 'Статус'")
-            status_col = len(header) + 1  # если нет — пишем в конец
-
-        # Записываем "Удалено" в правильную колонку
+        status_col = header.index("Статус") + 1 if "Статус" in header else len(header) + 1
         ws.update_cell(row_index, status_col, "Удалено")
 
-        # Теперь читаем строку для уведомления
         row = ws.row_values(row_index)
         sheet = ws.title
-
         if sheet == DEFECT_SHEET:
             msg = (f"ЗАПИСЬ БРАКА УДАЛЕНА\n"
-                   f"Линия: {row[2] if len(row)>2 else '?'}\n"
-                   f"{row[0] if len(row)>0 else '?'} {row[1] if len(row)>1 else '?'}\n"
-                   f"ЗНП: <code>{row[4] if len(row)>4 else '—'}</code>\n"
-                   f"Метров: {row[5] if len(row)>5 else '?'}")
+                   f"Линия: {row[2]}\n"
+                   f"{row[0]} {row[1]}\n"
+                   f"ЗНП: <code>{row[4]}</code>\n"
+                   f"Метров: {row[5]}")
             notify_controllers(get_controllers_cached(ws_ctrl_def), msg)
         else:
             action = "Запуск" if len(row)>3 and row[3] == "запуск" else "Остановка"
-            reason = row[4] if len(row)>4 else "—"
             msg = (f"ЗАПИСЬ СТАРТ/СТОП УДАЛЕНА\n"
-                   f"Линия: {row[2] if len(row)>2 else '?'}\n"
-                   f"{row[0] if len(row)>0 else '?'} {row[1] if len(row)>1 else '?'}\n"
+                   f"Линия: {row[2]}\n"
+                   f"{row[0]} {row[1]}\n"
                    f"Действие: {action}\n"
-                   f"Причина: {reason}")
+                   f"Причина: {row[4] if len(row)>4 else '—'}")
             notify_controllers(get_controllers_cached(ws_ctrl_ss), msg)
-
     except Exception as e:
         log.error(f"mark_as_deleted error: {e}")
-        
+
 # ==================== Клавиатуры ====================
 def keyboard(rows):
-    return {
-        "keyboard": [[{"text": t} for t in row] for row in rows],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-        "input_field_placeholder": "Выберите действие"
-    }
+    return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True}
 
-MAIN_KB = keyboard([
-    ["Старт/Стоп", "Брак"],
-    ["Отменить последнюю запись"]
+MAIN_KB = keyboard([["Старт/Стоп", "Брак"]])
+
+FLOW_MENU_KB = keyboard([
+    ["Новая запись"],
+    ["Отменить последнюю"],
+    ["Назад в меню"]
 ])
 
-CANCEL_KB = keyboard([["Отмена"]])
-CONFIRM_KB = keyboard([["Да, удалить", "Нет"]])
-
+# Остальные клавиатуры (причины, виды брака) — без изменений
 REASONS_CACHE = {"kb": None, "until": 0}
 DEFECTS_CACHE = {"kb": None, "until": 0}
 
@@ -277,7 +226,7 @@ def get_defect_kb():
         DEFECTS_CACHE["until"] = now + 86400
     return DEFECTS_CACHE["kb"]
 
-# ==================== Отправка сообщений ====================
+# ==================== Отправка ====================
 def send(chat_id, text, markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if markup:
@@ -287,7 +236,7 @@ def send(chat_id, text, markup=None):
     except Exception as e:
         log.exception(f"send error: {e}")
 
-# ==================== Таймауты ====================
+# ==================== Состояния ====================
 states = {}
 last_activity = {}
 TIMEOUT = 600
@@ -298,7 +247,7 @@ def timeout_worker():
         now = time.time()
         for uid in list(states):
             if now - last_activity.get(uid, now) > TIMEOUT:
-                send(states[uid]["chat"], "Диалог прерван — неактивность 10 минут.")
+                send(states[uid]["chat"], "Диалог прерван — неактивность 10 минут.", MAIN_KB)
                 states.pop(uid, None)
                 last_activity.pop(uid, None)
 
@@ -308,21 +257,24 @@ threading.Thread(target=timeout_worker, daemon=True).start()
 def process(uid, chat, text, user_repr):
     last_activity[uid] = time.time()
 
-    # === Подтверждение удаления ===
-    if uid in states and states[uid].get("step") == "delete_confirm":
+    # Подтверждение удаления
+    if uid in states and states[uid].get("await_confirm"):
+        ws = states[uid]["ws"]
+        row_index = states[uid]["row_index"]
         if text == "Да, удалить":
-            ws = states[uid]["data"]["ws"]
-            row_index = states[uid]["data"]["row_index"]
             mark_as_deleted(ws, row_index)
-            send(chat, "Запись помечена как <b>Удалено</b>.", MAIN_KB)
+            send(chat, "Запись удалена.", FLOW_MENU_KB)
         else:
-            send(chat, "Запись сохранена.", MAIN_KB)
+            send(chat, "Отмена удаления.", FLOW_MENU_KB)
         states.pop(uid, None)
         return
 
-    # === Главное меню + последние записи ===
+    # Главное меню
     if uid not in states:
-        if text in ("/start", "Старт/Стоп"):
+        if text in ("/start", "Назад в меню"):
+            send(chat, "<b>Выберите поток:</b>", MAIN_KB)
+            return
+        if text == "Старт/Стоп":
             records = get_last_records(ws_startstop, 2)
             msg = "<b>Последние записи Старт/Стоп:</b>\n\n"
             if not records:
@@ -333,10 +285,9 @@ def process(uid, chat, text, user_repr):
                     reason = r[4] if len(r) > 4 else "—"
                     msg += f"• {r[0]} {r[1]} | Линия {r[2]} | {action} | {reason}\n"
             send(chat, msg)
-            states[uid] = {"step": "line", "data": {}, "chat": chat, "flow": "startstop"}
-            send(chat, "Введите номер линии (1–15):", CANCEL_KB)
+            send(chat, "Что делаем?", FLOW_MENU_KB)
+            states[uid] = {"flow": "startstop", "chat": chat}
             return
-
         if text == "Брак":
             records = get_last_records(ws_defect, 2)
             msg = "<b>Последние записи Брака:</b>\n\n"
@@ -349,41 +300,45 @@ def process(uid, chat, text, user_repr):
                     defect = r[6] if len(r) > 6 else "—"
                     msg += f"• {r[0]} {r[1]} | Линия {r[2]} | <code>{znp}</code> | {meters}м | {defect}\n"
             send(chat, msg)
-            states[uid] = {"step": "line", "data": {"action": "брак"}, "chat": chat, "flow": "defect"}
-            send(chat, "Введите номер линии (1–15):", CANCEL_KB)
+            send(chat, "Что делаем?", FLOW_MENU_KB)
+            states[uid] = {"flow": "defect", "chat": chat}
             return
-
-        if text == "Отменить последнюю запись":
-            success, sheet_name, row, ws, row_index = find_last_entry(uid)
-            if not success:
-                send(chat, "У вас нет записей для отмены.", MAIN_KB)
-                return
-            action = row[3] if len(row) > 3 else "брак"
-            znp = row[4] if len(row) > 4 else "—"
-            meters = row[5] if len(row) > 5 else "—"
-            defect = row[6] if len(row) > 6 else "—"
-            msg = f"<b>Последняя запись ({sheet_name}):</b>\n"
-            msg += f"{row[0]} {row[1]} • Линия {row[2]}\n"
-            msg += f"Действие: {action}\n"
-            msg += f"ЗНП: <code>{znp}</code>\n"
-            msg += f"Брака: {meters}м | {defect}\n\n"
-            msg += "<b>Удалить эту запись?</b> (статус → «Удалено)"
-            send(chat, msg, CONFIRM_KB)
-            states[uid] = {"step": "delete_confirm", "chat": chat, "data": {"ws": ws, "row_index": row_index}}
-            return
-
         send(chat, "Выберите действие:", MAIN_KB)
         return
 
-    if text == "Отмена":
-        states.pop(uid, None)
-        send(chat, "Отменено.", MAIN_KB)
+    st = states[uid]
+    flow = st["flow"]
+
+    # Меню потока
+    if text == "Новая запись":
+        st["step"] = "line"
+        st["data"] = {}
+        send(chat, "Введите номер линии (1–15):", keyboard([["Отмена"]]))
         return
 
-    st = states[uid]
-    step = st["step"]
-    data = st["data"]
-    flow = st.get("flow", "startstop")
+    if text == "Отменить последнюю":
+        ws = ws_defect if flow == "defect" else ws_startstop
+        row, row_index = find_last_user_entry_in_sheet(uid, ws)
+        if not row:
+            send(chat, "У вас нет записей в этом потоке.", FLOW_MENU_KB)
+            return
+        action_text = "брак" if flow == "defect" else ("запуск" if len(row)>3 and row[3]=="запуск" else "остановка")
+        msg = f"<b>Удалить эту запись?</b>\n\n"
+        msg += f"{row[0]} {row[1]} • Линия {row[2]}\n"
+        msg += f"Действие: {action_text}\n"
+        if flow == "defect":
+            msg += f"ЗНП: <code>{row[4] if len(row)>4 else '—'}</code>\n"
+            msg += f"Брака: {row[5] if len(row)>5 else '?'}м"
+        else:
+            msg += f"Причина: {row[4] if len(row)>4 else '—'}"
+        send(chat, msg, keyboard([["Да, удалить", "Нет"]]))
+        states[uid] = {"await_confirm": True, "ws": ws, "row_index": row_index, "chat": chat}
+        return
+
+    if text == "Назад в меню":
+        states.pop(uid, None)
+        send(chat, "Главное меню:", MAIN_KB)
+        return
 
     # ==================== Все шаги (линия → дата → время → ...) ====================
     if step == "line":
