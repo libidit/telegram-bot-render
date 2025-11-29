@@ -62,15 +62,20 @@ ws_ctrl_ss   = get_ws(CTRL_STARTSTOP_SHEET)
 ws_ctrl_def  = get_ws(CTRL_DEFECT_SHEET)
 
 # ==================== Контролёры (кешируем) ====================
-def get_controllers(sheet):
-    try:
-        ids = sheet.col_values(1)[1:]
-        return [int(i.strip()) for i in ids if i.strip().isdigit()]
-    except:
-        return []
+CONTROLLERS_SS_CACHE = {"ids": [], "until": 0}
+CONTROLLERS_DEF_CACHE = {"ids": [], "until": 0}
 
-controllers_startstop = get_controllers(ws_ctrl_ss)
-controllers_defect = get_controllers(ws_ctrl_def)
+def get_controllers_cached(sheet):
+    now = time.time()
+    cache = CONTROLLERS_SS_CACHE if sheet.title == CTRL_STARTSTOP_SHEET else CONTROLLERS_DEF_CACHE
+    if now > cache["until"]:
+        try:
+            ids = sheet.col_values(1)[1:]
+            cache["ids"] = [int(i.strip()) for i in ids if i.strip().isdigit()]
+            cache["until"] = now + 600  # 10 минут
+        except:
+            pass  # оставляем старый кэш, если ошибка
+    return cache["ids"]
 
 # ==================== Последние записи (без "Удалено") ====================
 def get_last_records(ws, n=2):
@@ -135,7 +140,7 @@ def append_row(data):
                f"ЗНП: <code>{data.get('znp','—')}</code>\n"
                f"Метров брака: {data['meters']}\n"
                f"Вид брака: {data.get('defect_type','—')}")
-        notify_controllers(controllers_defect, msg)
+        notify_controllers(get_controllers_cached(ws_ctrl_def), msg)
     else:
         action_ru = "Запуск" if data["action"] == "запуск" else "Остановка"
         msg = (f"НОВАЯ ЗАПИСЬ СТАРТ/СТОП\n"
@@ -220,14 +225,14 @@ def get_reasons_kb():
     now = time.time()
     if now > REASONS_CACHE["until"]:
         REASONS_CACHE["kb"] = build_kb("Причина остановки", ["Другое"])
-        REASONS_CACHE["until"] = now + 300
+        REASONS_CACHE["until"] = now + 1440
     return REASONS_CACHE["kb"]
 
 def get_defect_kb():
     now = time.time()
     if now > DEFECTS_CACHE["until"]:
         DEFECTS_CACHE["kb"] = build_kb("Вид брака", ["Другое", "Без брака"])
-        DEFECTS_CACHE["until"] = now + 300
+        DEFECTS_CACHE["until"] = now + 1440
     return DEFECTS_CACHE["kb"]
 
 # ==================== Отправка сообщений ====================
