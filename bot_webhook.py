@@ -11,7 +11,6 @@ from flask import Flask, request
 import gspread
 from google.oauth2 import service_account
 from filelock import FileLock
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -310,31 +309,34 @@ def process(uid, chat, text, user_repr, message):
         return
 
     # === ОЖИДАНИЕ ФИО ===
-    if PENDING_USERS.get(uid) is None:
-        fio = text.strip()
-        if not re.match(r"^[А-ЯЁA-Z]+\s[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.$", fio, re.IGNORECASE):
-            send(chat, "Неверный формат.\n\nПример: <b>Петров А.В.</b>")
-            return
-
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Добавить", callback_data=f"approve_{uid}"),
-            InlineKeyboardButton("Отклонить", callback_data=f"reject_{uid}")
-        ]])
-
-        username = message["from"].get("username", "")
-        first_name = message["from"].get("first_name", "")
-        msg = (f"Запрос на доступ\n\n"
-               f"ФИО: <b>{fio.title()}</b>\n"
-               f"Имя: {first_name}\n"
-               f"Username: {username and '@'+username or '—'}\n"
-               f"ID: <code>{uid}</code>")
-
-        for master_id in list(masters) or [123456789]:  # запасной ID, если мастеров ещё нет
-            send(master_id, msg, kb)
-
-        PENDING_USERS[uid] = {"fio": fio.title(), "username": username, "first_name": first_name}
-        send(chat, "Заявка отправлена мастеру.\nОжидайте подтверждения.")
+if PENDING_USERS.get(uid) is None:
+    fio = text.strip()
+    if not re.match(r"^[А-ЯЁA-Z]+\s[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.$", fio, re.IGNORECASE):
+        send(chat, "Неверный формат.\n\nПример: <b>Петров А.В.</b>")
         return
+
+    # ← ЭТА ФУНКЦИЯ ВМЕСТО telegram
+    def inline_kb(rows):
+        return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
+
+    kb = inline_kb([
+        [("Добавить", f"approve_{uid}"), ("Отклонить", f"reject_{uid}")]
+    ])
+
+    username = message["from"].get("username", "")
+    first_name = message["from"].get("first_name", "")
+    msg = (f"Запрос на доступ\n\n"
+           f"ФИО: <b>{fio.title()}</b>\n"
+           f"Имя: {first_name}\n"
+           f"Username: {username and '@'+username or '—'}\n"
+           f"ID: <code>{uid}</code>")
+
+    for master_id in list(masters) or [123456789]:
+        send(master_id, msg, kb)
+
+    PENDING_USERS[uid] = {"fio": fio.title(), "username": username, "first_name": first_name}
+    send(chat, "Заявка отправлена мастеру.\nОжидайте подтверждения.")
+    return
 
 # === Подтверждение удаления ===
     if uid in states and states[uid].get("step") == "delete_confirm":
