@@ -471,18 +471,64 @@ def reject_by(approver_uid, target_uid):
 def process(uid, chat, text, user_repr):
     last_activity[uid] = time.time()
 
-    # Инициализация состояния для нового пользователя
+    # Инициализация состояния
     if uid not in states:
         states[uid] = {"chat": chat, "cancel_used": False}
 
     state = states[uid]
 
-    # ---- обработка выбора роли ----
-    # формат команды: /setrole_<target_uid>_<role>
+    # ============================================================
+    # === БЛОК №1 — ВСЕГДА разрешаем "Назад" и "Отмена"
+    # ============================================================
+    if text == "Назад":
+        states.pop(uid, None)
+        send(chat, "Главное меню:", MAIN_KB)
+        return
+
+    if text == "Отмена":
+        # снимаем ожидаемую отмену, если была
+        state.pop("pending_cancel", None)
+
+        # сбрасываем шаги заполнения
+        state.pop("step", None)
+        state.pop("data", None)
+
+        send(chat, "Отменено.", MAIN_KB)
+        return
+
+    # ============================================================
+    # === БЛОК №2 — Авторизация пользователя
+    # ============================================================
+    u = get_user(uid)
+
+    # Если нет в таблице — запрос ФИО
+    if u is None:
+        if state.get("fio_wait"):
+            fio = text.strip()
+            if not fio:
+                send(chat, "Введите корректное ФИО:", CANCEL_KB)
+                return
+            add_user(uid, fio, requested_by="")
+            notify_approvers_new_user(uid, fio)
+            send(chat, "Спасибо! Ваша заявка отправлена на подтверждение.")
+            states.pop(uid, None)
+            return
+        else:
+            state["fio_wait"] = True
+            send(chat, "Вы не зарегистрированы. Введите ваше ФИО:")
+            return
+
+    # Пользователь найден, но ещё не подтверждён
+    if u["status"] != "подтвержден":
+        send(chat, "Ваш доступ пока не подтверждён администратором.")
+        return
+
+    # ============================================================
+    # === Встроенная логика подтверждения ролей (оставлено как есть)
+    # ============================================================
     if text.startswith("/setrole_"):
         try:
             payload = text[len("/setrole_"):]
-            # payload: "<target_uid>_<role>"
             parts = payload.split("_", 1)
             if len(parts) != 2:
                 send(chat, "Неверная команда выбора роли.")
@@ -499,38 +545,30 @@ def process(uid, chat, text, user_repr):
         if not approver or approver["status"] != "подтвержден":
             send(chat, "Вы не можете назначать роли.")
             return
-
         if not target:
             send(chat, "Целевой пользователь не найден.")
             return
 
-        # Проверка разрешений мастера: мастер не может назначать admin
         if approver["role"] == "master" and new_role == "admin":
             send(chat, "Мастер не может назначать роль admin.")
             return
 
-        # Проверить допустимые роли
         if new_role not in ("operator", "master", "admin"):
             send(chat, "Неверная роль.")
             return
 
-        # Проверка: master не должен назначать higher role beyond allowed by can_approver_confirm
-        if not can_approver_confirm(approver["role"], new_role if new_role in ("operator","master","admin") else "operator"):
+        if not can_approver_confirm(approver["role"], new_role):
             send(chat, "У вас нет прав назначать такую роль.")
             return
 
-        # Назначаем роль и статус подтверждён
+        # Назначение
         update_user_role(target_uid, new_role)
         update_user_status(target_uid, "подтвержден")
 
-        # Записываем подтверждающего и дату
         idx = find_user_row_index(target_uid)
         if idx:
-            try:
-                ws_users.update(f"G{idx}", [[str(uid)]])
-                ws_users.update(f"H{idx}", [[now_msk().strftime("%Y-%m-%d %H:%M:%S")]])
-            except Exception as e:
-                log.exception("setrole: writing confirm data error: %s", e)
+            ws_users.update(f"G{idx}", [[str(uid)]])
+            ws_users.update(f"H{idx}", [[now_msk().strftime("%Y-%m-%d %H:%M:%S")]])
 
         send(chat, f"Пользователь {target['fio']} подтверждён и получил роль {new_role}.")
         try:
@@ -539,8 +577,7 @@ def process(uid, chat, text, user_repr):
             pass
         return
 
-    # === Обработка быстрых команд подтверждения/отклонения (от админов/мастеров) ===
-    # форматы: /approve_<uid> и /reject_<uid>
+    # Быстрое подтверждение / отклонение
     if text.startswith("/approve_") or text.startswith("/reject_"):
         parts = text.split("_", 1)
         if len(parts) == 2:
@@ -551,59 +588,22 @@ def process(uid, chat, text, user_repr):
                 send(chat, "Неверный формат команды.")
                 return
             if text.startswith("/approve_"):
-                # Instead of instant approve, open role selection (ask_role_selection)
                 approve_by(uid, target_id)
             else:
                 reject_by(uid, target_id)
             return
 
-    # === Проверка пользователя (авторизация) ===
-    u = get_user(uid)
-
-    # Если нет в таблице — спросить ФИО
-    if u is None:
-        # если уже ждали ФИО — обработать введённое как ФИО
-        if state.get("fio_wait"):
-            fio = text.strip()
-            if not fio:
-                send(chat, "Введите корректное ФИО:", CANCEL_KB)
-                return
-            add_user(uid, fio, requested_by="")
-            notify_approvers_new_user(uid, fio)
-            send(chat, "Спасибо! Ваша заявка отправлена на подтверждение.")
-            states.pop(uid, None)
-            return
-        else:
-            # попросить ФИО
-            states[uid]["fio_wait"] = True
-            send(chat, "Вы не зарегистрированы. Введите ваше ФИО:")
-            return
-
-    # Пользователь найден, но не подтвержден
-    if u["status"] != "подтвержден":
-        send(chat, "Ваш доступ пока не подтверждён администратором.")
-        return
-
-    # === Главные команды ===
-    if text == "Назад":
-        states.pop(uid, None)
-        send(chat, "Главное меню:", MAIN_KB)
-        return
-
-    if text == "Отмена":
-        state.pop("pending_cancel", None)
-        send(chat, "Отменено.", MAIN_KB)
-        return
-
-    # === Выбор потока ===
+    # ============================================================
+    # === Дальнейшая логика выбора потока
+    # ============================================================
     if "flow" not in state:
         if text in ("/start", "Старт/Стоп"):
             send(chat, "<b>Старт/Стоп</b>\nВыберите действие:", FLOW_MENU_KB)
-            state.update({"flow": "startstop"})
+            state["flow"] = "startstop"
             return
         elif text == "Брак":
             send(chat, "<b>Брак</b>\nВыберите действие:", FLOW_MENU_KB)
-            state.update({"flow": "defect"})
+            state["flow"] = "defect"
             return
         else:
             send(chat, "Выберите действие:", MAIN_KB)
@@ -611,10 +611,13 @@ def process(uid, chat, text, user_repr):
 
     flow = state["flow"]
 
-    # === Запрос на отмену ===
+    # ============================================================
+    # === Запрос отмены последней записи
+    # ============================================================
     if text == "Отменить последнюю запись":
-        if state.get("cancel_used", False):
-            send(chat, "Вы уже отменили одну запись в этом сеансе. Сделайте новую запись, чтобы снова отменить.", FLOW_MENU_KB)
+        if state.get("cancel_used"):
+            send(chat, "Вы уже отменили одну запись в этом сеансе. Сделайте новую запись, чтобы снова отменить.",
+                 FLOW_MENU_KB)
             return
 
         ws = ws_defect if flow == "defect" else ws_startstop
@@ -629,22 +632,20 @@ def process(uid, chat, text, user_repr):
         if flow == "startstop":
             action = "Запуск" if row[3] == "запуск" else "Остановка"
             msg = (f"Отменить эту запись?\n\n"
-                   f"<b>Старт/Стоп</b>\n"
-                   f"{row[0]} {row[1]} | Линия {row[2]}\n"
-                   f"Действие: {action}\n"
-                   f"Причина: {row[4] if len(row)>4 else '—'}")
+                   f"<b>Старт/Стоп</b>\n{row[0]} {row[1]} | Линия {row[2]}\n"
+                   f"Действие: {action}\nПричина: {row[4] if len(row)>4 else '—'}")
         else:
             msg = (f"Отменить эту запись?\n\n"
-                   f"<b>Брак</b>\n"
-                   f"{row[0]} {row[1]} | Линия {row[2]}\n"
-                   f"ЗНП: <code>{row[4]}</code>\n"
-                   f"Метров: {row[5]}\n"
-                   f"Вид брака: {row[6] if len(row)>6 else '—'}")
+                   f"<b>Брак</b>\n{row[0]} {row[1]} | Линия {row[2]}\n"
+                   f"ЗНП: <code>{row[4]}</code>\nМетров: {row[5]}\n"
+                   f"Вид: {row[6] if len(row)>6 else '—'}")
 
         send(chat, msg, CONFIRM_KB)
         return
 
-    # === Подтверждение отмены ===
+    # ============================================================
+    # === Подтверждение отмены
+    # ============================================================
     if "pending_cancel" in state:
         pend = state["pending_cancel"]
 
@@ -677,29 +678,37 @@ def process(uid, chat, text, user_repr):
             state.pop("pending_cancel", None)
             return
 
-    # === Новая запись ===
+    # ============================================================
+    # === Новая запись
+    # ============================================================
     if text == "Новая запись":
-        state["cancel_used"] = False  # сброс флага отмены
+        state["cancel_used"] = False
 
         if flow == "defect":
             records = get_last_records(ws_defect, 2)
             msg = "<b>Последние записи Брака:</b>\n\n"
-            msg += "\n".join(f"• {r[0]} {r[1]} | Линия {r[2]} | <code>{r[4] if len(r)>4 else '—'}</code> | {r[5] if len(r)>5 else '—'}м"
-                             for r in records) if records else "Нет записей."
+            msg += "\n".join(
+                f"• {r[0]} {r[1]} | Линия {r[2]} | <code>{r[4]}</code> | {r[5]}м"
+                for r in records) if records else "Нет записей."
             send(chat, msg)
-            state.update({"step": "line", "data": {"action": "брак"}})
+            state["step"] = "line"
+            state["data"] = {"action": "брак"}
         else:
             records = get_last_records(ws_startstop, 2)
             msg = "<b>Последние записи Старт/Стоп:</b>\n\n"
-            msg += "\n".join(f"• {r[0]} {r[1]} | Линия {r[2]} | {'Запуск' if r[3]=='запуск' else 'Остановка'} | {r[4] if len(r)>4 else '—'}"
-                             for r in records) if records else "Нет записей."
+            msg += "\n".join(
+                f"• {r[0]} {r[1]} | Линия {r[2]} | {'Запуск' if r[3]=='запуск' else 'Остановка'} | {r[4]}"
+                for r in records) if records else "Нет записей."
             send(chat, msg)
-            state.update({"step": "line", "data": {}})
+            state["step"] = "line"
+            state["data"] = {}
 
         send(chat, "Введите номер линии (1–15):", NUM_LINE_KB)
         return
 
-    # === Обработка шагов записи ===
+    # ============================================================
+    # === Обработка шагов записи (всё как в 4.1)
+    # ============================================================
     st = state
     step = st.get("step")
     data = st.get("data", {})
