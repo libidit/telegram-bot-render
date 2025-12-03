@@ -236,9 +236,10 @@ def process(uid, chat, text, user_repr):
         states.pop(uid, None)
         send(chat, "Главное меню:", MAIN_KB)
         return
-
+    
     if text == "Отмена":
-        state.pop("pending_cancel", None)
+        states.pop(uid, None)        # ← ВАЖНО: полностью очищаем состояние
+        last_activity.pop(uid, None)
         send(chat, "Отменено.", MAIN_KB)
         return
 
