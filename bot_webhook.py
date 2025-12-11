@@ -838,7 +838,7 @@ class FSM:
                 if len(text) == 10 and text[5] == "-" and text[:5].upper() in valid_set:
                     data["znp"] = text.upper()
                     st["step"] = "meters"
-                    tg_send(chat, "Сколько метров брака?", NUMERIC_KB)
+                    tg_send(chat, "Сколько метров брака?", NUMERIC_INPUT_KB)
                     return
                 tg_send(chat, "Неправильный формат ЗНП.\nПример: <code>D1225-1234</code>", CANCEL_KB)
                 return
