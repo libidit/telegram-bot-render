@@ -22,6 +22,7 @@ log = logging.getLogger("bot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN")  # опционально
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON]):
     raise RuntimeError("Missing required env vars")
@@ -54,20 +55,36 @@ CTRL_STARTSTOP_SHEET = "Контр_Старт-Стоп"
 CTRL_DEFECT_SHEET = "Контр_Брак"
 USERS_SHEET = "Пользователи"
 
-HEADERS_STARTSTOP = ["Дата", "Время", "Номер линии", "Действие", "Причина", "ЗНП", "Метров брака", "Вид брака",
-                     "Пользователь", "Время отправки", "Статус"]
-USERS_HEADERS = ["TelegramID", "ФИО", "Роль", "Статус", "Запросил у", "Дата создания", "Подтвердил", "Дата подтверждения"]
+HEADERS_STARTSTOP = [
+    "Дата", "Время", "Номер линии", "Действие", "Причина",
+    "ЗНП", "Метров брака", "Вид брака",
+    "Пользователь", "Время отправки", "Статус"
+]
+USERS_HEADERS = [
+    "TelegramID", "ФИО", "Роль", "Статус",
+    "Запросил у", "Дата создания", "Подтвердил", "Дата подтверждения"
+]
 
-# ========== Telegram send wrapper ==========
+
+# ========== Telegram API wrapper ==========
+def tg_api_call(method: str, payload: dict):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            log.warning("Telegram API %s failed: %s %s", method, resp.status_code, resp.text)
+        return resp
+    except Exception:
+        log.exception("Telegram API %s error", method)
+        return None
+
+
 def tg_send(chat_id: int, text: str, markup: Optional[dict] = None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if markup:
         # ensure ascii=False for Cyrillic in reply_markup
         payload["reply_markup"] = json.dumps(markup, ensure_ascii=False)
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        log.exception("tg_send error: %s", e)
+    tg_api_call("sendMessage", payload)
 
 
 # ========== SheetClient — encapsulate sheet ops + caching ==========
@@ -145,7 +162,10 @@ class SheetClient:
                 return idx
         return None
 
-    def update_user(self, uid: int, role: Optional[str] = None, status: Optional[str] = None, confirmed_by: Optional[int] = None):
+    def update_user(self, uid: int,
+                    role: Optional[str] = None,
+                    status: Optional[str] = None,
+                    confirmed_by: Optional[int] = None):
         idx = self.find_user_row_index(uid)
         if not idx:
             return
@@ -242,7 +262,9 @@ class SheetClient:
 sheet_client = SheetClient(sh, cache_ttl=5)
 
 # ========== Keyboards & helpers ==========
-def kb_reply(rows: List[List[str]], one_time: bool = False, placeholder: Optional[str] = None, input_field_placeholder: Optional[str] = None) -> dict:
+def kb_reply(rows: List[List[str]], one_time: bool = False,
+             placeholder: Optional[str] = None,
+             input_field_placeholder: Optional[str] = None) -> dict:
     kb = {"keyboard": [[{"text": t} for t in row] for row in rows],
           "resize_keyboard": True,
           "one_time_keyboard": one_time}
@@ -314,18 +336,27 @@ def get_defect_kb() -> dict:
 
 
 # Controllers list (cached)
-_CONTROLLERS_CACHE: Dict[str, Any] = {"startstop": {"until": 0, "data": []}, "defect": {"until": 0, "data": []}}
+_CONTROLLERS_CACHE: Dict[str, Any] = {
+    "startstop": {"until": 0, "data": []},
+    "defect": {"until": 0, "data": []},
+}
+
+
 def get_controllers_cached(sheet_name: str, ttl: int = 600) -> List[int]:
     key = "startstop" if sheet_name == CTRL_STARTSTOP_SHEET else "defect"
     now_ts = time.time()
-    if _CONTROLLERS_CACHE[key]["until"] > now_ts and _CONTROLLERS_CACHE[key]["data"]:
-        return _CONTROLLERS_CACHE[key]["data"]
+    cache = _CONTROLLERS_CACHE[key]
+
+    if cache["until"] > now_ts and cache["data"]:
+        return cache["data"]
+
     try:
         data = sheet_client.get_controllers(sheet_name)
     except Exception:
         data = []
-    _CONTROLLERS_CACHE[key]["data"] = data
-    _CONTROLLERS_CACHE[key]["until"] = now_ts + ttl
+
+    cache["data"] = data
+    cache["until"] = now_ts + ttl
     return data
 
 
@@ -344,6 +375,11 @@ def znp_prefixes_now() -> Tuple[List[str], str, str]:
     prev = f"{prev_month:02d}{str(prev_year)[2:]}"
     valid = [f"D{curr}", f"L{curr}", f"D{prev}", f"L{prev}"]
     return valid, curr, prev
+
+
+# pending approval notifications: target_uid -> [(chat_id, message_id), ...]
+_PENDING_REQUESTS: Dict[int, List[Tuple[int, int]]] = {}
+
 
 # ========== AuthManager ==========
 class AuthManager:
@@ -372,18 +408,71 @@ class AuthManager:
             ]
         }
         text = f"<b>Новая заявка на доступ</b>\nФИО: {fio}\nID: <code>{uid}</code>"
+
+        _PENDING_REQUESTS[uid] = []
+
         for a in approvers:
             try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                              json={"chat_id": a, "text": text, "parse_mode": "HTML", "reply_markup": json.dumps(kb, ensure_ascii=False)},
-                              timeout=10)
+                resp = tg_api_call("sendMessage", {
+                    "chat_id": a,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": json.dumps(kb, ensure_ascii=False),
+                })
+                if resp is not None:
+                    try:
+                        data = resp.json()
+                        mid = data.get("result", {}).get("message_id")
+                        if mid:
+                            _PENDING_REQUESTS[uid].append((a, mid))
+                    except Exception:
+                        log.exception("Failed to parse Telegram response for approver %s", a)
             except Exception:
                 log.exception("notify approver failed for %s", a)
+
+    def _mark_request_processed_for_all(self, target_id: int, status_text: str):
+        """
+        Обновляет все сообщения с заявкой для данного пользователя:
+        меняет текст и убирает inline-кнопки.
+        """
+        requests_list = _PENDING_REQUESTS.pop(target_id, [])
+        for chat_id, message_id in requests_list:
+            try:
+                tg_api_call("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": status_text,
+                    "parse_mode": "HTML",
+                })
+            except Exception:
+                log.exception(
+                    "Failed to edit approval message for chat %s msg %s",
+                    chat_id, message_id
+                )
+
+    def _close_single_request_message(self, callback: dict, info_text: str):
+        """
+        Если заявка уже обработана, закрываем клавиатуру для конкретного сообщения
+        и сообщаем пользователю.
+        """
+        chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"]["message_id"]
+        try:
+            tg_api_call("editMessageReplyMarkup", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            })
+        except Exception:
+            log.exception("Failed to clear inline keyboard for processed request")
+        tg_send(chat_id, info_text)
 
     def process_callback(self, callback: dict):
         data = callback.get("data", "")
         uid = callback["from"]["id"]
         chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"]["message_id"]
+
         if data.startswith("approve_") or data.startswith("reject_"):
             target_id = int(data.split("_", 1)[1])
             approver = self.get_user(uid)
@@ -392,8 +481,16 @@ class AuthManager:
                 return
             target = self.get_user(target_id)
             if not target:
-                tg_send(chat_id, "Целевой пользователь не найден.")
+                self._close_single_request_message(callback, "Целевой пользователь не найден или заявка уже обработана.")
                 return
+
+            if target["status"] != "ожидает":
+                self._close_single_request_message(
+                    callback,
+                    f"Заявка для {target['fio']} уже обработана (статус: {target['status']})."
+                )
+                return
+
             if data.startswith("approve_"):
                 # build inline kb to set role
                 roles = ["operator", "master"]
@@ -401,6 +498,16 @@ class AuthManager:
                     roles.append("admin")
                 kb = {"inline_keyboard": [[{"text": r, "callback_data": f"setrole_{target_id}_{r}"}] for r in roles]}
                 tg_send(chat_id, f"Выберите роль для <b>{target['fio']}</b>:", kb)
+
+                # убираем кнопки approve/reject в этом сообщении
+                try:
+                    tg_api_call("editMessageReplyMarkup", {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+                except Exception:
+                    log.exception("Failed to clear inline keyboard on approve click")
             else:
                 # reject
                 self.sc.update_user(target_id, status="отклонен", confirmed_by=uid)
@@ -409,6 +516,15 @@ class AuthManager:
                     tg_send(int(target_id), "В доступе отказано.")
                 except Exception:
                     pass
+
+                status_text = (
+                    f"<b>Заявка обработана</b>\n"
+                    f"ФИО: {target['fio']}\n"
+                    f"ID: <code>{target_id}</code>\n"
+                    f"Статус: <b>отклонена</b>"
+                )
+                self._mark_request_processed_for_all(target_id, status_text)
+
         elif data.startswith("setrole_"):
             parts = data.split("_")
             if len(parts) < 3:
@@ -422,18 +538,51 @@ class AuthManager:
             if approver["role"] == "master" and role == "admin":
                 tg_send(chat_id, "Мастер не может назначать роль admin.")
                 return
+
+            target = self.get_user(target_id)
+            if not target:
+                self._close_single_request_message(callback, "Целевой пользователь не найден или заявка уже обработана.")
+                return
+            if target["status"] != "ожидает":
+                self._close_single_request_message(
+                    callback,
+                    f"Заявка для {target['fio']} уже обработана (статус: {target['status']})."
+                )
+                return
+
             # final assignment
             self.sc.update_user(target_id, role=role, status="подтвержден", confirmed_by=uid)
             target = self.get_user(target_id)
             tg_send(chat_id, f"Пользователь {target['fio']} подтверждён как <b>{role}</b>")
+
+            # уберём клавиатуру выбора роли из этого сообщения
+            try:
+                tg_api_call("editMessageReplyMarkup", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                })
+            except Exception:
+                log.exception("Failed to clear role selection keyboard")
+
             # notify target
             try:
                 tg_send(int(target_id), f"Ваша заявка подтверждена! Ваша роль: {role}\n\nВыберите действие:", MAIN_KB)
             except Exception:
                 pass
 
+            status_text = (
+                f"<b>Заявка обработана</b>\n"
+                f"ФИО: {target['fio']}\n"
+                f"ID: <code>{target_id}</code>\n"
+                f"Роль: <b>{role}</b>\n"
+                f"Статус: <b>подтверждена</b>"
+            )
+            self._mark_request_processed_for_all(target_id, status_text)
+
 
 auth = AuthManager(sheet_client)
+
 
 # ========== FSM: управление состояниями и диалогами ==========
 class FSM:
@@ -473,6 +622,13 @@ class FSM:
         self.states.pop(uid, None)
         self.last_activity.pop(uid, None)
 
+    def send_main_menu(self, chat: int, user_fio: Optional[str] = None):
+        if user_fio:
+            first_name = user_fio.split()[0]
+            tg_send(chat, f"Привет, {first_name}! Выберите действие:", MAIN_KB)
+        else:
+            tg_send(chat, "Главное меню:", MAIN_KB)
+
     def handle_text(self, uid: int, chat: int, text: str, user_repr: str):
         self.touch(uid)
         self.ensure_state(uid, chat)
@@ -480,19 +636,18 @@ class FSM:
 
         # --- command handlers (role approvals) ---
         if text.startswith("/setrole_") or text.startswith("/approve_") or text.startswith("/reject_"):
-            # forward to auth manager style handlers if needed (we use inline callbacks for approvals)
             tg_send(chat, "Команда обработана через UI подтверждений (используйте инлайн-кнопки).")
             return
 
         # --- basic navigation ---
         if text == "Назад":
             self.clear_state(uid)
-            tg_send(chat, "Главное меню:", MAIN_KB)
+            self.send_main_menu(chat)
             return
         if text == "Отмена":
             st.pop("pending_cancel", None)
             self.clear_state(uid)
-            tg_send(chat, "Отменено.", MAIN_KB)
+            self.send_main_menu(chat)
             return
 
         # --- user auth check ---
@@ -501,14 +656,14 @@ class FSM:
             if st.get("waiting_fio"):
                 fio = text.strip()
                 if not fio:
-                    tg_send(chat, "Введите корректное ФИО:")
+                    tg_send(chat, "Введите корректное ФИО:", CANCEL_KB)
                     return
                 self.auth.register_user(uid, fio, requested_by="")
                 tg_send(chat, "Спасибо! Ваша заявка отправлена на подтверждение.")
                 self.clear_state(uid)
                 return
             st["waiting_fio"] = True
-            tg_send(chat, "Вы не зарегистрированы. Введите ваше ФИО:")
+            tg_send(chat, "Вы не зарегистрированы. Введите ваше ФИО:", CANCEL_KB)
             return
 
         if user["status"] != "подтвержден":
@@ -526,7 +681,7 @@ class FSM:
                 tg_send(chat, "<b>Брак</b>\nВыберите действие:", FLOW_MENU_KB)
                 return
             # otherwise greet
-            tg_send(chat, f"Привет, {user['fio'].split()[0]}! Выберите действие:", MAIN_KB)
+            self.send_main_menu(chat, user["fio"])
             return
 
         flow = st["flow"]
@@ -535,25 +690,25 @@ class FSM:
             if st.get("cancel_used", False):
                 tg_send(chat, "Вы уже отменили одну запись в этом сеансе. Сделайте новую запись, чтобы снова отменить.", FLOW_MENU_KB)
                 return
-        
+
             sheet = DEFECT_SHEET if flow == "defect" else STARTSTOP_SHEET
             row, rownum = self.sc.find_last_active_record(sheet, uid)
             if not row:
                 tg_send(chat, "У вас нет активных записей для отмены.", FLOW_MENU_KB)
                 return
-        
+
             st["pending_cancel"] = {"ws": sheet, "row": row, "rownum": rownum}
-        
+
             date, time_ = row[0], row[1]
             line = row[2]
-        
+
             if sheet == STARTSTOP_SHEET:
                 action = "Запуск" if row[3] == "запуск" else "Остановка"
                 reason = row[4] if len(row) > 4 else "—"
                 znp = row[5] if len(row) > 5 else ""
                 meters = row[6] if len(row) > 6 else ""
                 defect_type = row[7] if len(row) > 7 else ""
-        
+
                 msg = (
                     f"Вы уверены, что хотите отменить эту запись?\n\n"
                     f"<b>Старт/Стоп</b>\n"
@@ -562,15 +717,18 @@ class FSM:
                     f"Действие: {action}\n"
                     f"Причина: {reason}\n"
                 )
-                if znp: msg += f"ЗНП: <code>{znp}</code>\n"
-                if meters: msg += f"Метров брака: {meters}\n"
-                if defect_type: msg += f"Вид брака: {defect_type}\n"
-        
+                if znp:
+                    msg += f"ЗНП: <code>{znp}</code>\n"
+                if meters:
+                    msg += f"Метров брака: {meters}\n"
+                if defect_type:
+                    msg += f"Вид брака: {defect_type}\n"
+
             else:
                 znp = row[4] if len(row) > 4 else "—"
                 meters = row[5] if len(row) > 5 else "—"
                 defect_type = row[6] if len(row) > 6 else "—"
-        
+
                 msg = (
                     f"Вы уверены, что хотите отменить эту запись?\n\n"
                     f"<b>Брак</b>\n"
@@ -580,10 +738,9 @@ class FSM:
                     f"Метров: {meters}\n"
                     f"Вид брака: {defect_type}\n"
                 )
-        
+
             tg_send(chat, msg, CONFIRM_KB)
             return
-
 
         # --- confirm cancel ---
         if "pending_cancel" in st:
@@ -592,15 +749,14 @@ class FSM:
                 ws_title = pend["ws"]
                 row = pend["row"]
                 rownum = pend["rownum"]
-        
+
                 # set status to CANCELLED
                 status_col = "K" if ws_title == STARTSTOP_SHEET else "J"
                 try:
                     self.sc.update_cell(ws_title, f"{status_col}{rownum}", "ОТМЕНЕНО")
                 except Exception:
                     log.exception("Failed to mark canceled")
-        
-                # build full cancel message for the user
+
                 if ws_title == STARTSTOP_SHEET:
                     date, time_ = row[0], row[1]
                     line = row[2]
@@ -609,7 +765,7 @@ class FSM:
                     znp = row[5] if len(row) > 5 else ""
                     meters = row[6] if len(row) > 6 else ""
                     defect_type = row[7] if len(row) > 7 else ""
-        
+
                     user_msg = (
                         f"❌ <b>Запись отменена</b>\n\n"
                         f"Дата и время: {date} {time_}\n"
@@ -617,19 +773,22 @@ class FSM:
                         f"Действие: {action}\n"
                         f"Причина: {reason}\n"
                     )
-                    if znp: user_msg += f"ЗНП: <code>{znp}</code>\n"
-                    if meters: user_msg += f"Метров брака: {meters}\n"
-                    if defect_type: user_msg += f"Вид брака: {defect_type}\n"
-        
+                    if znp:
+                        user_msg += f"ЗНП: <code>{znp}</code>\n"
+                    if meters:
+                        user_msg += f"Метров брака: {meters}\n"
+                    if defect_type:
+                        user_msg += f"Вид брака: {defect_type}\n"
+
                     user_msg += f"\nОтменил: {user['fio']}"
-        
+
                 else:  # DEFECT
                     date, time_ = row[0], row[1]
                     line = row[2]
                     znp = row[4] if len(row) > 4 else "—"
                     meters = row[5] if len(row) > 5 else "—"
                     defect_type = row[6] if len(row) > 6 else "—"
-        
+
                     user_msg = (
                         f"❌ <b>Запись брака отменена</b>\n\n"
                         f"Дата и время: {date} {time_}\n"
@@ -639,10 +798,9 @@ class FSM:
                         f"Вид брака: {defect_type}\n"
                         f"\nОтменил: {user['fio']}"
                     )
-        
-                # send message to user
+
                 tg_send(chat, user_msg, FLOW_MENU_KB)
-        
+
                 # notify controllers
                 if ws_title == STARTSTOP_SHEET:
                     ctrl_msg = (
@@ -652,16 +810,21 @@ class FSM:
                         f"Действие: {action}\n"
                         f"Причина: {reason}\n"
                     )
-                    if znp: ctrl_msg += f"ЗНП: <code>{znp}</code>\n"
-                    if meters: ctrl_msg += f"Метров брака: {meters}\n"
-                    if defect_type: ctrl_msg += f"Вид брака: {defect_type}\n"
-        
+                    if znp:
+                        ctrl_msg += f"ЗНП: <code>{znp}</code>\n"
+                    if meters:
+                        ctrl_msg += f"Метров брака: {meters}\n"
+                    if defect_type:
+                        ctrl_msg += f"Вид брака: {defect_type}\n"
+
                     ctrl_msg += f"\nОтменил: {user['fio']}"
-        
+
                     for cid in get_controllers_cached(CTRL_STARTSTOP_SHEET):
-                        try: tg_send(cid, ctrl_msg)
-                        except: pass
-        
+                        try:
+                            tg_send(cid, ctrl_msg)
+                        except Exception:
+                            pass
+
                 else:
                     ctrl_msg = (
                         f"⚠️ <b>ОТМЕНЕНА ЗАПИСЬ БРАКА</b>\n\n"
@@ -673,18 +836,19 @@ class FSM:
                         f"\nОтменил: {user['fio']}"
                     )
                     for cid in get_controllers_cached(CTRL_DEFECT_SHEET):
-                        try: tg_send(cid, ctrl_msg)
-                        except: pass
-        
+                        try:
+                            tg_send(cid, ctrl_msg)
+                        except Exception:
+                            pass
+
                 st["cancel_used"] = True
                 st.pop("pending_cancel", None)
                 return
-        
+
             if text == "Нет, оставить":
                 tg_send(chat, "Запись сохранена.", FLOW_MENU_KB)
                 st.pop("pending_cancel", None)
                 return
-
 
         # --- New record ---
         if text == "Новая запись":
@@ -693,7 +857,11 @@ class FSM:
                 recent = self.sc.get_last_records(DEFECT_SHEET, 2)
                 msg = "<b>Последние записи Брака:</b>\n\n"
                 if recent:
-                    msg += "\n".join(f"• {r[0]} {r[1]} | Линия {r[2]} | <code>{r[4] if len(r)>4 else '—'}</code> | {r[5] if len(r)>5 else '—'}м" for r in recent)
+                    msg += "\n".join(
+                        f"• {r[0]} {r[1]} | Линия {r[2]} | "
+                        f"<code>{r[4] if len(r) > 4 else '—'}</code> | "
+                        f"{r[5] if len(r) > 5 else '—'}м" for r in recent
+                    )
                 else:
                     msg += "Нет записей."
                 tg_send(chat, msg)
@@ -702,7 +870,11 @@ class FSM:
                 recent = self.sc.get_last_records(STARTSTOP_SHEET, 2)
                 msg = "<b>Последние записи Старт/Стоп:</b>\n\n"
                 if recent:
-                    msg += "\n".join(f"• {r[0]} {r[1]} | Линия {r[2]} | {'Запуск' if (len(r)>3 and r[3]=='запуск') else 'Остановка'} | {r[4] if len(r)>4 else '—'}" for r in recent)
+                    msg += "\n".join(
+                        f"• {r[0]} {r[1]} | Линия {r[2]} | "
+                        f"{'Запуск' if (len(r) > 3 and r[3] == 'запуск') else 'Остановка'} | "
+                        f"{r[4] if len(r) > 4 else '—'}" for r in recent
+                    )
                 else:
                     msg += "Нет записей."
                 tg_send(chat, msg)
@@ -822,7 +994,6 @@ class FSM:
             if step == "znp_prefix":
                 if text in valid_set:
                     data["znp_prefix"] = text
-                    # now ask for last 4 digits — show numeric keyboard
                     st["step"] = "znp_last4"
                     tg_send(chat, f"Последние 4 цифры ЗНП для <b>{text}</b>-XXXX:", NUMERIC_INPUT_KB)
                     return
@@ -830,11 +1001,11 @@ class FSM:
                     st["step"] = "znp_manual"
                     tg_send(chat, "Введите полный ЗНП (пример: D1225-1234):", CANCEL_KB)
                     return
-                # maybe user typed 4 digits immediately but we didn't have prefix — disallow
-                tg_send(chat, "Выберите префикс:", kb_reply([[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]))
+                tg_send(chat, "Выберите префикс:", kb_reply(
+                    [[f"D{curr}", f"L{curr}"], [f"D{prev}", f"L{prev}"], ["Другое", "Отмена"]]
+                ))
                 return
             else:  # znp_manual
-                # expect format D1225-1234 (10 chars with '-')
                 if len(text) == 10 and text[5] == "-" and text[:5].upper() in valid_set:
                     data["znp"] = text.upper()
                     st["step"] = "meters"
@@ -843,7 +1014,7 @@ class FSM:
                 tg_send(chat, "Неправильный формат ЗНП.\nПример: <code>D1225-1234</code>", CANCEL_KB)
                 return
 
-        # --- step: znp_last4 (new) ---
+        # --- step: znp_last4 ---
         if step == "znp_last4":
             if not (text.isdigit() and len(text) == 4):
                 tg_send(chat, "Введите последние 4 цифры:", NUMERIC_INPUT_KB)
@@ -874,46 +1045,50 @@ class FSM:
                 return
             data["defect_type"] = "" if text == "Без брака" else text
 
-            # finalize record
-            # attach user fio and id
             data["user"] = f"{user['fio']} ({uid})"
             data["flow"] = flow
 
-            # build row according to sheet structure
             if flow == "defect":
-                # DEFECT: Date, Time, Line, (no action), ZNP, Meters, DefectType, User, TS, Status
-                row = [data["date"], data["time"], data["line"],
-                       # For compatibility keep position 4 empty or "брак"? In original V3.9 they used "брак" in column 4,
-                       # but user said "Брак" sheet doesn't have action; to keep compatibility we will NOT add action, we will shift:
-                       # We'll use columns: Date, Time, Line, ZNP, Meters, DefectType, User, TS, Status
-                       # To keep consistent column count, we will build row matching existing sheet expectation in original code:
-                       # original append_row for defect used: [date, time, line, "брак", znp, meters, defect_type, user, ts, ""]
-                       # but we've been told "Брак" doesn't have action; still many sheets historically had that 4th column; to be safe,
-                       # we will keep the same append as original V3.9 but consumer code that reads will handle absence.
-                       "брак",
-                       data.get("znp", ""), data.get("meters", ""), data.get("defect_type", ""), data.get("user", ""), now_msk_str(), ""
-                       ]
+                row = [
+                    data["date"],
+                    data["time"],
+                    data["line"],
+                    "брак",
+                    data.get("znp", ""),
+                    data.get("meters", ""),
+                    data.get("defect_type", ""),
+                    data.get("user", ""),
+                    now_msk_str(),
+                    ""
+                ]
                 target_sheet = DEFECT_SHEET
             else:
-                # STARTSTOP: Date, Time, Line, Action, Reason, ZNP, Meters, DefectType, User, TS, Status
-                row = [data["date"], data["time"], data["line"], data.get("action", ""),
-                       data.get("reason", ""), data.get("znp", ""), data.get("meters", ""), data.get("defect_type", ""),
-                       data.get("user", ""), now_msk_str(), ""]
+                row = [
+                    data["date"],
+                    data["time"],
+                    data["line"],
+                    data.get("action", ""),
+                    data.get("reason", ""),
+                    data.get("znp", ""),
+                    data.get("meters", ""),
+                    data.get("defect_type", ""),
+                    data.get("user", ""),
+                    now_msk_str(),
+                    ""
+                ]
                 target_sheet = STARTSTOP_SHEET
 
-            # append to sheet
             try:
                 self.sc.append_record(target_sheet, row)
             except Exception:
                 log.exception("Failed to append record")
 
-            # prepare full confirmation for user
-            dt = f"{data.get('date','') } {data.get('time','')}"
+            dt = f"{data.get('date', '')} {data.get('time', '')}"
             line = data.get("line", "")
             if flow == "defect":
                 znp = data.get("znp", "—")
                 meters = data.get("meters", "—")
-                defect_type = "Без брака" if data.get("defect_type","") == "" else data.get("defect_type","")
+                defect_type = "Без брака" if data.get("defect_type", "") == "" else data.get("defect_type", "")
                 confirm_text = (
                     f"✅ <b>Запись брака сохранена</b>\n\n"
                     f"Линия: <b>{line}</b>\n"
@@ -923,15 +1098,16 @@ class FSM:
                     f"Вид брака: <b>{defect_type}</b>\n\n"
                     f"Добавил: {user['fio']}"
                 )
-                # notify controllers with full info + fio
                 controllers = get_controllers_cached(CTRL_DEFECT_SHEET)
-                notify_msg = (f"⚠️ <b>НОВАЯ ЗАПИСЬ БРАКА</b>\n\n"
-                              f"Линия: <b>{line}</b>\n"
-                              f"Дата и время: {dt}\n"
-                              f"ЗНП: <code>{znp}</code>\n"
-                              f"Метров брака: {meters}\n"
-                              f"Вид брака: {defect_type}\n"
-                              f"Добавил: {user['fio']}")
+                notify_msg = (
+                    f"⚠️ <b>НОВАЯ ЗАПИСЬ БРАКА</b>\n\n"
+                    f"Линия: <b>{line}</b>\n"
+                    f"Дата и время: {dt}\n"
+                    f"ЗНП: <code>{znp}</code>\n"
+                    f"Метров брака: {meters}\n"
+                    f"Вид брака: {defect_type}\n"
+                    f"Добавил: {user['fio']}"
+                )
                 for cid in controllers:
                     try:
                         tg_send(cid, notify_msg)
@@ -943,11 +1119,13 @@ class FSM:
                 znp = data.get("znp", "—")
                 meters = data.get("meters", "")
                 defect_type = data.get("defect_type", "")
-                confirm_text = (f"✅ <b>Запись Старт/Стоп сохранена</b>\n\n"
-                                f"Линия: <b>{line}</b>\n"
-                                f"Дата и время: <b>{dt}</b>\n"
-                                f"Действие: <b>{action_ru}</b>\n"
-                                f"Причина: <b>{reason}</b>\n")
+                confirm_text = (
+                    f"✅ <b>Запись Старт/Стоп сохранена</b>\n\n"
+                    f"Линия: <b>{line}</b>\n"
+                    f"Дата и время: <b>{dt}</b>\n"
+                    f"Действие: <b>{action_ru}</b>\n"
+                    f"Причина: <b>{reason}</b>\n"
+                )
                 if znp and znp != "—":
                     confirm_text += f"ЗНП: <code>{znp}</code>\n"
                 if meters:
@@ -956,13 +1134,14 @@ class FSM:
                     confirm_text += f"Вид брака: <b>{defect_type}</b>\n"
                 confirm_text += f"\nДобавил: {user['fio']}"
 
-                # notify controllers
                 controllers = get_controllers_cached(CTRL_STARTSTOP_SHEET)
-                notify_msg = (f"⚠️ <b>НОВАЯ ЗАПИСЬ СТАРТ/СТОП</b>\n\n"
-                              f"Линия: <b>{line}</b>\n"
-                              f"Дата и время: {dt}\n"
-                              f"Действие: {action_ru}\n"
-                              f"Причина: {reason}\n")
+                notify_msg = (
+                    f"⚠️ <b>НОВАЯ ЗАПИСЬ СТАРТ/СТОП</b>\n\n"
+                    f"Линия: <b>{line}</b>\n"
+                    f"Дата и время: {dt}\n"
+                    f"Действие: {action_ru}\n"
+                    f"Причина: {reason}\n"
+                )
                 if znp and znp != "—":
                     notify_msg += f"ЗНП: <code>{znp}</code>\n"
                 if meters:
@@ -976,36 +1155,53 @@ class FSM:
                     except Exception:
                         pass
 
-            # send confirmation to user
             tg_send(chat, confirm_text, MAIN_KB)
-            # finalize state
             self.clear_state(uid)
             return
 
         # fallback
         tg_send(chat, "Выберите действие:", FLOW_MENU_KB)
 
+
 # ========== Flask webhook & callbacks ==========
 app = Flask(__name__)
 LOCK_PATH = "/tmp/bot.lock"
+RATE_LIMIT_WINDOW = 1.0  # секунды между сообщениями от одного пользователя
+_last_message_at: Dict[int, float] = {}
+
+
+@app.before_request
+def verify_telegram_secret():
+    """
+    Если задан TELEGRAM_SECRET_TOKEN, проверяем заголовок
+    X-Telegram-Bot-Api-Secret-Token.
+    """
+    if request.method == "POST" and request.path == "/" and TELEGRAM_SECRET_TOKEN:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token != TELEGRAM_SECRET_TOKEN:
+            log.warning("Invalid Telegram secret token: %r", token)
+            return "forbidden", 403
+
 
 # start controllers refresher thread that warms cache once per day
 def controllers_refresher_worker(interval_min: int = 1440):
     while True:
         try:
-            # invalidate and prefetch
-            sheet_client.invalidate_cache(CTRL_STARTSTOP_SHEET)
-            sheet_client.invalidate_cache(CTRL_DEFECT_SHEET)
-            _ = sheet_client.get_controllers(CTRL_STARTSTOP_SHEET)
-            _ = sheet_client.get_controllers(CTRL_DEFECT_SHEET)
+            now_ts = time.time()
+            for sheet_name, key in ((CTRL_STARTSTOP_SHEET, "startstop"), (CTRL_DEFECT_SHEET, "defect")):
+                data = sheet_client.get_controllers(sheet_name)
+                _CONTROLLERS_CACHE[key]["data"] = data
+                _CONTROLLERS_CACHE[key]["until"] = now_ts + interval_min * 60
             log.info("Controllers cache refreshed")
         except Exception:
             log.exception("Error refreshing controllers cache")
         time.sleep(interval_min * 60)
 
+
 threading.Thread(target=controllers_refresher_worker, daemon=True).start()
 
 fsm = FSM(sheet_client, auth)
+
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -1017,9 +1213,9 @@ def webhook():
     if "callback_query" in update:
         try:
             auth.process_callback(update["callback_query"])
-            # answer callback
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-                          json={"callback_query_id": update["callback_query"]["id"]})
+            tg_api_call("answerCallbackQuery", {
+                "callback_query_id": update["callback_query"]["id"]
+            })
         except Exception:
             log.exception("callback processing error")
         return "ok", 200
@@ -1034,6 +1230,14 @@ def webhook():
     username = m["from"].get("username", "")
     user_repr = f"{user_id} (@{username or 'no_user'})"
 
+    # простой анти-флуд
+    now_ts = time.time()
+    last_ts = _last_message_at.get(user_id, 0.0)
+    if now_ts - last_ts < RATE_LIMIT_WINDOW:
+        log.info("Rate limited user %s", user_id)
+        return "ok", 200
+    _last_message_at[user_id] = now_ts
+
     with FileLock(LOCK_PATH):
         try:
             fsm.handle_text(user_id, chat_id, text, user_repr)
@@ -1041,9 +1245,11 @@ def webhook():
             log.exception("Processing error")
     return "ok", 200
 
+
 @app.route("/health")
 def health():
     return "ok", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
